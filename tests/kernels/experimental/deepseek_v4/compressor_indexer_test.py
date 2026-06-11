@@ -25,12 +25,11 @@ projection matmul.
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store_indexer)
+    compress_norm_rope_store_indexer, indexer_packed_width)
 from tpu_inference.kernels.experimental.deepseek_v4.compress_store import (
     save_partial_states)
 from tpu_inference.kernels.experimental.deepseek_v4.compressor import (
@@ -99,12 +98,11 @@ def _make_inputs(
     cos_sin_cache = rng.standard_normal(
         (max_pos, rope_head_dim), dtype=np.float32)
 
-    n_qb = head_dim // quant_block
+    packed_width = indexer_packed_width(head_dim, quant_block)
     state_cache = np.zeros(
         (num_state_blocks, block_size, 2 * state_width), dtype=np.float32)
-    fp8_cache = np.zeros(
-        (kv_num_blocks, kv_blk, head_dim), dtype=ml_dtypes.float8_e4m3fn)
-    scale_cache = np.zeros((kv_num_blocks, kv_blk, n_qb), dtype=np.float32)
+    kv_cache = np.zeros(
+        (kv_num_blocks, kv_blk, packed_width), dtype=np.uint8)
 
     return dict(
         hidden_states=hidden_states, wkv_wgate=wkv_wgate, ape=ape,
@@ -112,7 +110,7 @@ def _make_inputs(
         positions=positions, slot_mapping=slot_mapping,
         block_table=block_table, token_to_req_indices=token_to_req_indices,
         kv_slot_mapping=kv_slot_mapping, state_cache=state_cache,
-        fp8_cache=fp8_cache, scale_cache=scale_cache,
+        kv_cache=kv_cache,
         block_size=block_size, head_dim=head_dim, rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio, overlap=overlap, rms_eps=1e-6,
         quant_block=quant_block)
@@ -141,22 +139,21 @@ def _reference(kw):
         slot_mapping=jnp.asarray(kw["slot_mapping"]),
         compress_ratio=kw["compress_ratio"])
 
-    fp8_cache, scale_cache = compress_norm_rope_store_indexer(
+    kv_cache = compress_norm_rope_store_indexer(
         state_cache=state_cache,
         positions=jnp.asarray(kw["positions"]),
         slot_mapping=jnp.asarray(kw["slot_mapping"]),
         block_table=jnp.asarray(kw["block_table"]),
         token_to_req_indices=jnp.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jnp.asarray(kw["kv_slot_mapping"]),
-        fp8_cache=jnp.asarray(kw["fp8_cache"]),
-        scale_cache=jnp.asarray(kw["scale_cache"]),
+        kv_cache=jnp.asarray(kw["kv_cache"]),
         rms_weight=jnp.asarray(kw["norm_weight"]),
         cos_sin_cache=jnp.asarray(kw["cos_sin_cache"]),
         block_size=kw["block_size"], head_dim=kw["head_dim"],
         rope_head_dim=kw["rope_head_dim"],
         compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
         rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
-    return state_cache, fp8_cache, scale_cache
+    return state_cache, kv_cache
 
 
 _CASES = [
@@ -173,20 +170,18 @@ def test_compressor_forward_indexer_matches_composition(
         compress_ratio, overlap, seq_len, num_pad, seed):
     kw = _make_inputs(compress_ratio, overlap, seq_len=seq_len,
                       num_pad=num_pad, seed=seed)
-    exp_state, exp_fp8, exp_scale = _reference(kw)
+    exp_state, exp_kv = _reference(kw)
 
-    act_state, act_fp8, act_scale = compressor_forward_indexer(**_to_jax(kw))
+    act_state, act_kv = compressor_forward_indexer(**_to_jax(kw))
 
     np.testing.assert_allclose(
         np.asarray(act_state), np.asarray(exp_state), rtol=1e-5, atol=1e-5)
+    # Both sides drive the same packed kernel, so the byte buffer is exact.
     np.testing.assert_array_equal(
-        np.asarray(act_fp8).astype(np.float32),
-        np.asarray(exp_fp8).astype(np.float32))
-    np.testing.assert_allclose(
-        np.asarray(act_scale), np.asarray(exp_scale), rtol=1e-6, atol=1e-6)
+        np.asarray(act_kv), np.asarray(exp_kv))
 
     assert np.any(np.asarray(act_state) != 0.0)
-    assert np.any(np.asarray(act_fp8).astype(np.float32) != 0.0)
+    assert np.any(np.asarray(act_kv) != 0)
 
 
 def test_compressor_forward_indexer_eval_shape():
@@ -195,7 +190,7 @@ def test_compressor_forward_indexer_eval_shape():
 
     def fn(hidden_states, wkv_wgate, ape, norm_weight, cos_sin_cache,
            positions, slot_mapping, block_table, token_to_req_indices,
-           kv_slot_mapping, state_cache, fp8_cache, scale_cache):
+           kv_slot_mapping, state_cache, kv_cache):
         return compressor_forward_indexer(
             hidden_states=hidden_states, wkv_wgate=wkv_wgate, ape=ape,
             norm_weight=norm_weight, cos_sin_cache=cos_sin_cache,
@@ -203,37 +198,32 @@ def test_compressor_forward_indexer_eval_shape():
             block_table=block_table,
             token_to_req_indices=token_to_req_indices,
             kv_slot_mapping=kv_slot_mapping, state_cache=state_cache,
-            fp8_cache=fp8_cache, scale_cache=scale_cache,
+            kv_cache=kv_cache,
             block_size=kw["block_size"], head_dim=kw["head_dim"],
             rope_head_dim=kw["rope_head_dim"],
             compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
             rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
 
-    out_state, out_fp8, out_scale = jax.eval_shape(
+    out_state, out_kv = jax.eval_shape(
         fn, jkw["hidden_states"], jkw["wkv_wgate"], jkw["ape"],
         jkw["norm_weight"], jkw["cos_sin_cache"], jkw["positions"],
         jkw["slot_mapping"], jkw["block_table"], jkw["token_to_req_indices"],
-        jkw["kv_slot_mapping"], jkw["state_cache"], jkw["fp8_cache"],
-        jkw["scale_cache"])
+        jkw["kv_slot_mapping"], jkw["state_cache"], jkw["kv_cache"])
     assert out_state.shape == kw["state_cache"].shape
-    assert out_fp8.shape == kw["fp8_cache"].shape
-    assert out_fp8.dtype == jnp.float8_e4m3fn
-    assert out_scale.shape == kw["scale_cache"].shape
+    assert out_kv.shape == kw["kv_cache"].shape
+    assert out_kv.dtype == jnp.uint8
 
 
 @requires_tpu
 def test_compressor_forward_indexer_runs_on_tpu():
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
-    exp_state, exp_fp8, exp_scale = _reference(kw)
+    exp_state, exp_kv = _reference(kw)
 
-    act_state, act_fp8, act_scale = compressor_forward_indexer(**_to_jax(kw))
-    act_fp8.block_until_ready()
-    assert act_fp8.devices().pop().platform == "tpu"
+    act_state, act_kv = compressor_forward_indexer(**_to_jax(kw))
+    act_kv.block_until_ready()
+    assert act_kv.devices().pop().platform == "tpu"
 
     np.testing.assert_allclose(
         np.asarray(act_state), np.asarray(exp_state), rtol=1e-4, atol=1e-4)
     np.testing.assert_array_equal(
-        np.asarray(act_fp8).astype(np.float32),
-        np.asarray(exp_fp8).astype(np.float32))
-    np.testing.assert_allclose(
-        np.asarray(act_scale), np.asarray(exp_scale), rtol=1e-5, atol=1e-5)
+        np.asarray(act_kv), np.asarray(exp_kv))

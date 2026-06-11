@@ -35,7 +35,7 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store)
+    compress_norm_rope_store, sparse_packed_width, unpack_sparse_kv_cache)
 from tpu_inference.layers.common.quantization import quantize_tensor
 
 requires_tpu = pytest.mark.skipif(
@@ -70,19 +70,26 @@ def _interleaved_rope_ref(x, cos_sin, rope_head_dim):
 
 def compress_norm_rope_store_ref(
     state_cache, positions, slot_mapping, block_table, token_to_req_indices,
-    kv_slot_mapping, nope_cache, rope_cache, scale_cache, rms_weight,
+    kv_slot_mapping, kv_cache, rms_weight,
     cos_sin_cache, block_size, head_dim, rope_head_dim, compress_ratio, overlap,
     rms_eps, quant_block,
 ):
-    """Naive NumPy ground truth, one token at a time."""
-    nope_out = nope_cache.copy()
-    rope_out = rope_cache.copy()
-    scale_out = scale_cache.copy()
+    """Naive NumPy ground truth, one token at a time.
+
+    Returns the three logical components (nope/rope/scale) the packed cache
+    encodes; the test unpacks the kernel's single buffer and compares.
+    """
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     window = coff * compress_ratio
-    kv_blk = nope_cache.shape[1]
+    kv_num_blocks, kv_blk, _ = kv_cache.shape
     nope_dim = head_dim - rope_head_dim
+    n_qb = nope_dim // quant_block
+    nope_out = np.zeros(
+        (kv_num_blocks, kv_blk, nope_dim), dtype=ml_dtypes.float8_e4m3fn)
+    rope_out = np.zeros(
+        (kv_num_blocks, kv_blk, rope_head_dim), dtype=ml_dtypes.bfloat16)
+    scale_out = np.zeros((kv_num_blocks, kv_blk, n_qb), dtype=np.float32)
 
     num_tokens = positions.shape[0]
     for t in range(num_tokens):
@@ -190,20 +197,17 @@ def _make_inputs(
     cos_sin_cache = rng.standard_normal(
         (max_pos, rope_head_dim), dtype=np.float32)
 
-    nope_dim = head_dim - rope_head_dim
-    n_qb = nope_dim // quant_block
-    nope_cache = np.zeros(
-        (kv_num_blocks, kv_blk, nope_dim), dtype=ml_dtypes.float8_e4m3fn)
-    rope_cache = np.zeros(
-        (kv_num_blocks, kv_blk, rope_head_dim), dtype=ml_dtypes.bfloat16)
-    scale_cache = np.zeros((kv_num_blocks, kv_blk, n_qb), dtype=np.float32)
+    packed_width = sparse_packed_width(
+        head_dim - rope_head_dim, rope_head_dim, quant_block)
+    kv_cache = np.zeros(
+        (kv_num_blocks, kv_blk, packed_width), dtype=np.uint8)
 
     return dict(
         state_cache=state_cache, positions=positions,
         slot_mapping=slot_mapping, block_table=block_table,
         token_to_req_indices=token_to_req_indices,
-        kv_slot_mapping=kv_slot_mapping, nope_cache=nope_cache,
-        rope_cache=rope_cache, scale_cache=scale_cache, rms_weight=rms_weight,
+        kv_slot_mapping=kv_slot_mapping, kv_cache=kv_cache,
+        rms_weight=rms_weight,
         cos_sin_cache=cos_sin_cache, block_size=block_size, head_dim=head_dim,
         rope_head_dim=rope_head_dim, compress_ratio=compress_ratio,
         overlap=overlap, rms_eps=1e-6, quant_block=quant_block)
@@ -234,7 +238,10 @@ def test_compress_norm_rope_store_matches_reference(
                       num_pad=num_pad, seed=seed)
     exp_nope, exp_rope, exp_scale = compress_norm_rope_store_ref(**kw)
 
-    act_nope, act_rope, act_scale = compress_norm_rope_store(**_to_jax(kw))
+    act_kv = compress_norm_rope_store(**_to_jax(kw))
+    nope_dim = kw["head_dim"] - kw["rope_head_dim"]
+    act_nope, act_rope, act_scale = unpack_sparse_kv_cache(
+        act_kv, nope_dim, kw["rope_head_dim"], kw["quant_block"])
 
     # Compare fp8 / bf16 payloads bit-exactly and power-of-two scales tightly.
     np.testing.assert_array_equal(
@@ -251,30 +258,26 @@ def test_compress_norm_rope_store_eval_shape():
     jkw = _to_jax(kw)
 
     def fn(state_cache, positions, slot_mapping, block_table,
-           token_to_req_indices, kv_slot_mapping, nope_cache, rope_cache,
-           scale_cache, rms_weight, cos_sin_cache):
+           token_to_req_indices, kv_slot_mapping, kv_cache, rms_weight,
+           cos_sin_cache):
         return compress_norm_rope_store(
             state_cache=state_cache, positions=positions,
             slot_mapping=slot_mapping, block_table=block_table,
             token_to_req_indices=token_to_req_indices,
-            kv_slot_mapping=kv_slot_mapping, nope_cache=nope_cache,
-            rope_cache=rope_cache, scale_cache=scale_cache,
+            kv_slot_mapping=kv_slot_mapping, kv_cache=kv_cache,
             rms_weight=rms_weight, cos_sin_cache=cos_sin_cache,
             block_size=kw["block_size"], head_dim=kw["head_dim"],
             rope_head_dim=kw["rope_head_dim"],
             compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
             rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
 
-    out_nope, out_rope, out_scale = jax.eval_shape(
+    out_kv = jax.eval_shape(
         fn, jkw["state_cache"], jkw["positions"], jkw["slot_mapping"],
         jkw["block_table"], jkw["token_to_req_indices"],
-        jkw["kv_slot_mapping"], jkw["nope_cache"], jkw["rope_cache"],
-        jkw["scale_cache"], jkw["rms_weight"], jkw["cos_sin_cache"])
-    assert out_nope.shape == kw["nope_cache"].shape
-    assert out_nope.dtype == jnp.float8_e4m3fn
-    assert out_rope.shape == kw["rope_cache"].shape
-    assert out_rope.dtype == jnp.bfloat16
-    assert out_scale.shape == kw["scale_cache"].shape
+        jkw["kv_slot_mapping"], jkw["kv_cache"], jkw["rms_weight"],
+        jkw["cos_sin_cache"])
+    assert out_kv.shape == kw["kv_cache"].shape
+    assert out_kv.dtype == jnp.uint8
 
 
 @requires_tpu
@@ -283,9 +286,13 @@ def test_compress_norm_rope_store_runs_on_tpu():
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
     exp_nope, exp_rope, exp_scale = compress_norm_rope_store_ref(**kw)
 
-    act_nope, act_rope, act_scale = compress_norm_rope_store(**_to_jax(kw))
-    act_nope.block_until_ready()
-    assert act_nope.devices().pop().platform == "tpu"
+    act_kv = compress_norm_rope_store(**_to_jax(kw))
+    act_kv.block_until_ready()
+    assert act_kv.devices().pop().platform == "tpu"
+
+    nope_dim = kw["head_dim"] - kw["rope_head_dim"]
+    act_nope, act_rope, act_scale = unpack_sparse_kv_cache(
+        act_kv, nope_dim, kw["rope_head_dim"], kw["quant_block"])
 
     np.testing.assert_array_equal(
         np.asarray(act_nope).astype(np.float32), exp_nope.astype(np.float32))

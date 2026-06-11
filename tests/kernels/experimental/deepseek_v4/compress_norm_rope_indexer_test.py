@@ -35,7 +35,8 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store_indexer)
+    compress_norm_rope_store_indexer, indexer_packed_width,
+    unpack_indexer_kv_cache)
 from tpu_inference.layers.common.quantization import quantize_tensor
 
 requires_tpu = pytest.mark.skipif(
@@ -69,17 +70,23 @@ def _interleaved_rope_ref(x, cos_sin, rope_head_dim):
 
 def compress_norm_rope_store_indexer_ref(
     state_cache, positions, slot_mapping, block_table, token_to_req_indices,
-    kv_slot_mapping, fp8_cache, scale_cache, rms_weight, cos_sin_cache,
+    kv_slot_mapping, kv_cache, rms_weight, cos_sin_cache,
     block_size, head_dim, rope_head_dim, compress_ratio, overlap, rms_eps,
     quant_block,
 ):
-    """Naive NumPy ground truth, one token at a time."""
-    fp8_out = fp8_cache.copy()
-    scale_out = scale_cache.copy()
+    """Naive NumPy ground truth, one token at a time.
+
+    Returns the (fp8, scale) components the packed cache encodes; the test
+    unpacks the kernel's single buffer and compares.
+    """
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     window = coff * compress_ratio
-    kv_blk = fp8_cache.shape[1]
+    kv_num_blocks, kv_blk, _ = kv_cache.shape
+    n_qb = head_dim // quant_block
+    fp8_out = np.zeros(
+        (kv_num_blocks, kv_blk, head_dim), dtype=ml_dtypes.float8_e4m3fn)
+    scale_out = np.zeros((kv_num_blocks, kv_blk, n_qb), dtype=np.float32)
 
     num_tokens = positions.shape[0]
     for t in range(num_tokens):
@@ -180,17 +187,16 @@ def _make_inputs(
     cos_sin_cache = rng.standard_normal(
         (max_pos, rope_head_dim), dtype=np.float32)
 
-    n_qb = head_dim // quant_block
-    fp8_cache = np.zeros(
-        (kv_num_blocks, kv_blk, head_dim), dtype=ml_dtypes.float8_e4m3fn)
-    scale_cache = np.zeros((kv_num_blocks, kv_blk, n_qb), dtype=np.float32)
+    packed_width = indexer_packed_width(head_dim, quant_block)
+    kv_cache = np.zeros(
+        (kv_num_blocks, kv_blk, packed_width), dtype=np.uint8)
 
     return dict(
         state_cache=state_cache, positions=positions,
         slot_mapping=slot_mapping, block_table=block_table,
         token_to_req_indices=token_to_req_indices,
-        kv_slot_mapping=kv_slot_mapping, fp8_cache=fp8_cache,
-        scale_cache=scale_cache, rms_weight=rms_weight,
+        kv_slot_mapping=kv_slot_mapping, kv_cache=kv_cache,
+        rms_weight=rms_weight,
         cos_sin_cache=cos_sin_cache, block_size=block_size, head_dim=head_dim,
         rope_head_dim=rope_head_dim, compress_ratio=compress_ratio,
         overlap=overlap, rms_eps=1e-6, quant_block=quant_block)
@@ -221,7 +227,9 @@ def test_compress_norm_rope_store_indexer_matches_reference(
                       num_pad=num_pad, seed=seed)
     exp_fp8, exp_scale = compress_norm_rope_store_indexer_ref(**kw)
 
-    act_fp8, act_scale = compress_norm_rope_store_indexer(**_to_jax(kw))
+    act_kv = compress_norm_rope_store_indexer(**_to_jax(kw))
+    act_fp8, act_scale = unpack_indexer_kv_cache(
+        act_kv, kw["head_dim"], kw["quant_block"])
 
     # Compare the fp8 payload bit-exactly and power-of-two scales tightly.
     np.testing.assert_array_equal(
@@ -236,27 +244,26 @@ def test_compress_norm_rope_store_indexer_eval_shape():
     jkw = _to_jax(kw)
 
     def fn(state_cache, positions, slot_mapping, block_table,
-           token_to_req_indices, kv_slot_mapping, fp8_cache, scale_cache,
+           token_to_req_indices, kv_slot_mapping, kv_cache,
            rms_weight, cos_sin_cache):
         return compress_norm_rope_store_indexer(
             state_cache=state_cache, positions=positions,
             slot_mapping=slot_mapping, block_table=block_table,
             token_to_req_indices=token_to_req_indices,
-            kv_slot_mapping=kv_slot_mapping, fp8_cache=fp8_cache,
-            scale_cache=scale_cache, rms_weight=rms_weight,
+            kv_slot_mapping=kv_slot_mapping, kv_cache=kv_cache,
+            rms_weight=rms_weight,
             cos_sin_cache=cos_sin_cache, block_size=kw["block_size"],
             head_dim=kw["head_dim"], rope_head_dim=kw["rope_head_dim"],
             compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
             rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
 
-    out_fp8, out_scale = jax.eval_shape(
+    out_kv = jax.eval_shape(
         fn, jkw["state_cache"], jkw["positions"], jkw["slot_mapping"],
         jkw["block_table"], jkw["token_to_req_indices"],
-        jkw["kv_slot_mapping"], jkw["fp8_cache"], jkw["scale_cache"],
+        jkw["kv_slot_mapping"], jkw["kv_cache"],
         jkw["rms_weight"], jkw["cos_sin_cache"])
-    assert out_fp8.shape == kw["fp8_cache"].shape
-    assert out_fp8.dtype == jnp.float8_e4m3fn
-    assert out_scale.shape == kw["scale_cache"].shape
+    assert out_kv.shape == kw["kv_cache"].shape
+    assert out_kv.dtype == jnp.uint8
 
 
 @requires_tpu
@@ -265,9 +272,12 @@ def test_compress_norm_rope_store_indexer_runs_on_tpu():
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
     exp_fp8, exp_scale = compress_norm_rope_store_indexer_ref(**kw)
 
-    act_fp8, act_scale = compress_norm_rope_store_indexer(**_to_jax(kw))
-    act_fp8.block_until_ready()
-    assert act_fp8.devices().pop().platform == "tpu"
+    act_kv = compress_norm_rope_store_indexer(**_to_jax(kw))
+    act_kv.block_until_ready()
+    assert act_kv.devices().pop().platform == "tpu"
+
+    act_fp8, act_scale = unpack_indexer_kv_cache(
+        act_kv, kw["head_dim"], kw["quant_block"])
 
     np.testing.assert_array_equal(
         np.asarray(act_fp8).astype(np.float32), exp_fp8.astype(np.float32))

@@ -56,7 +56,9 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store, compress_norm_rope_store_indexer, interleaved_rope)
+    compress_norm_rope_store, compress_norm_rope_store_indexer,
+    indexer_packed_width, interleaved_rope, sparse_packed_width,
+    unpack_indexer_kv_cache, unpack_sparse_kv_cache)
 from tpu_inference.layers.common.quantization import quantize_tensor
 
 # Triton (imported lazily in ``_load_gpu_kernels``) must run in interpret mode
@@ -212,15 +214,15 @@ def _decode_gpu(byte_cache, slots, kv_blk, token_stride, scale_dim, nope_dim,
     return out
 
 
-def _decode_tpu(nope_cache, rope_cache, scale_cache, slots, kv_blk,
-                quant_block):
-    """Decode the JAX three-tensor cache for the given KV slots."""
-    nope = np.asarray(nope_cache).astype(np.float32)
-    rope = np.asarray(rope_cache).astype(np.float32)
-    scale = np.asarray(scale_cache).astype(np.float32)
-    nope_dim = nope.shape[-1]
-    rope_dim = rope.shape[-1]
-    out = np.zeros((len(slots), nope_dim + rope_dim), np.float32)
+def _decode_tpu(kv_cache, slots, kv_blk, quant_block, nope_dim,
+                rope_head_dim):
+    """Decode the JAX packed sparse KV cache for the given KV slots."""
+    nope_c, rope_c, scale_c = unpack_sparse_kv_cache(
+        kv_cache, nope_dim, rope_head_dim, quant_block)
+    nope = np.asarray(nope_c).astype(np.float32)
+    rope = np.asarray(rope_c).astype(np.float32)
+    scale = np.asarray(scale_c).astype(np.float32)
+    out = np.zeros((len(slots), nope_dim + rope_head_dim), np.float32)
     for i, slot in enumerate(slots):
         b, p = divmod(int(slot), kv_blk)
         out[i, :nope_dim] = nope[b, p] * np.repeat(scale[b, p], quant_block)
@@ -250,11 +252,11 @@ def _decode_gpu_indexer(byte_cache, slots, kv_blk, token_stride, scale_dim):
     return out
 
 
-def _decode_tpu_indexer(fp8_cache, scale_cache, slots, kv_blk):
-    """Decode the JAX indexer fp8 cache + single fp32 scale per token."""
-    fp8 = np.asarray(fp8_cache).astype(np.float32)
-    scale = np.asarray(scale_cache).astype(np.float32)
-    head_dim = fp8.shape[-1]
+def _decode_tpu_indexer(kv_cache, slots, kv_blk, head_dim, quant_block):
+    """Decode the JAX packed indexer cache (fp8 + single fp32 scale)."""
+    fp8_c, scale_c = unpack_indexer_kv_cache(kv_cache, head_dim, quant_block)
+    fp8 = np.asarray(fp8_c).astype(np.float32)
+    scale = np.asarray(scale_c).astype(np.float32)
     out = np.zeros((len(slots), head_dim), np.float32)
     for i, slot in enumerate(slots):
         b, p = divmod(int(slot), kv_blk)
@@ -321,15 +323,9 @@ def _run_tpu(kw):
     rope_head_dim = kw["rope_head_dim"]
     quant_block = kw["quant_block"]
     nope_dim = head_dim - rope_head_dim
-    n_qb = nope_dim // quant_block
-    nope_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], nope_dim),
-        dtype=ml_dtypes.float8_e4m3fn)
-    rope_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], rope_head_dim),
-        dtype=ml_dtypes.bfloat16)
-    scale_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], n_qb), dtype=np.float32)
+    packed_width = sparse_packed_width(nope_dim, rope_head_dim, quant_block)
+    kv_cache = np.zeros(
+        (kw["kv_num_blocks"], kw["kv_blk"], packed_width), dtype=np.uint8)
 
     return compress_norm_rope_store(
         state_cache=jax.numpy.asarray(kw["state_cache"]),
@@ -338,9 +334,7 @@ def _run_tpu(kw):
         block_table=jax.numpy.asarray(kw["block_table"]),
         token_to_req_indices=jax.numpy.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jax.numpy.asarray(kw["kv_slot_mapping"]),
-        nope_cache=jax.numpy.asarray(nope_cache),
-        rope_cache=jax.numpy.asarray(rope_cache),
-        scale_cache=jax.numpy.asarray(scale_cache),
+        kv_cache=jax.numpy.asarray(kv_cache),
         rms_weight=jax.numpy.asarray(kw["rms_weight"]),
         cos_sin_cache=jax.numpy.asarray(kw["cos_sin_cache"]),
         block_size=kw["block_size"], head_dim=head_dim,
@@ -401,12 +395,9 @@ def _run_gpu_indexer(kw):
 def _run_tpu_indexer(kw):
     head_dim = kw["head_dim"]
     quant_block = kw["quant_block"]
-    n_qb = head_dim // quant_block
-    fp8_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], head_dim),
-        dtype=ml_dtypes.float8_e4m3fn)
-    scale_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], n_qb), dtype=np.float32)
+    packed_width = indexer_packed_width(head_dim, quant_block)
+    kv_cache = np.zeros(
+        (kw["kv_num_blocks"], kw["kv_blk"], packed_width), dtype=np.uint8)
 
     return compress_norm_rope_store_indexer(
         state_cache=jax.numpy.asarray(kw["state_cache"]),
@@ -415,8 +406,7 @@ def _run_tpu_indexer(kw):
         block_table=jax.numpy.asarray(kw["block_table"]),
         token_to_req_indices=jax.numpy.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jax.numpy.asarray(kw["kv_slot_mapping"]),
-        fp8_cache=jax.numpy.asarray(fp8_cache),
-        scale_cache=jax.numpy.asarray(scale_cache),
+        kv_cache=jax.numpy.asarray(kv_cache),
         rms_weight=jax.numpy.asarray(kw["rms_weight"]),
         cos_sin_cache=jax.numpy.asarray(kw["cos_sin_cache"]),
         block_size=kw["block_size"], head_dim=head_dim,
@@ -471,15 +461,15 @@ def test_matches_gpu_triton_sparse_kernel(
     assert slots.size > 0, "test case has no boundary tokens"
 
     byte_cache, token_stride, scale_dim = _run_gpu(kw)
-    nope_cache, rope_cache, scale_cache = _run_tpu(kw)
+    tpu_kv = _run_tpu(kw)
 
     nope_dim = kw["head_dim"] - kw["rope_head_dim"]
     gpu = _decode_gpu(
         byte_cache, slots, kw["kv_blk"], token_stride, scale_dim, nope_dim,
         kw["rope_head_dim"], kw["quant_block"])
     tpu = _decode_tpu(
-        nope_cache, rope_cache, scale_cache, slots, kw["kv_blk"],
-        kw["quant_block"])
+        tpu_kv, slots, kw["kv_blk"], kw["quant_block"], nope_dim,
+        kw["rope_head_dim"])
 
     # The nope head is fp8 (3 mantissa bits) and Triton's interpret-mode fp8
     # cast rounds differently from JAX's by up to ~1 ULP/element (see the
@@ -514,11 +504,12 @@ def test_matches_gpu_triton_indexer_kernel(
     assert slots.size > 0, "test case has no boundary tokens"
 
     byte_cache, token_stride, scale_dim = _run_gpu_indexer(kw)
-    fp8_cache, scale_cache = _run_tpu_indexer(kw)
+    tpu_kv = _run_tpu_indexer(kw)
 
     gpu = _decode_gpu_indexer(
         byte_cache, slots, kw["kv_blk"], token_stride, scale_dim)
-    tpu = _decode_tpu_indexer(fp8_cache, scale_cache, slots, kw["kv_blk"])
+    tpu = _decode_tpu_indexer(
+        tpu_kv, slots, kw["kv_blk"], kw["head_dim"], kw["quant_block"])
 
     # Whole head is fp8 (rope tail included); interpret-mode rounding applies
     # to all 128 dims, so use the same relaxed tolerance as the sparse nope.
@@ -539,8 +530,9 @@ def test_gpu_and_tpu_sparse_scales_are_identical_exponents():
     n_nb = nope_dim // qb
 
     byte_cache, token_stride, scale_dim = _run_gpu(kw)
-    _, _, scale_cache = _run_tpu(kw)
-    scale_cache = np.asarray(scale_cache).astype(np.float32)
+    _, _, scale_c = unpack_sparse_kv_cache(
+        _run_tpu(kw), nope_dim, kw["rope_head_dim"], qb)
+    scale_cache = np.asarray(scale_c).astype(np.float32)
 
     flat = byte_cache.reshape(byte_cache.shape[0], -1)
     for slot in slots:
@@ -563,8 +555,9 @@ def test_gpu_and_tpu_indexer_scales_are_identical_exponents():
     slots = _boundary_slots(kw)
 
     byte_cache, token_stride, scale_dim = _run_gpu_indexer(kw)
-    _, scale_cache = _run_tpu_indexer(kw)
-    scale_cache = np.asarray(scale_cache).astype(np.float32)
+    _, scale_c = unpack_indexer_kv_cache(
+        _run_tpu_indexer(kw), kw["head_dim"], kw["quant_block"])
+    scale_cache = np.asarray(scale_c).astype(np.float32)
 
     flat = byte_cache.reshape(byte_cache.shape[0], -1)
     for slot in slots:
