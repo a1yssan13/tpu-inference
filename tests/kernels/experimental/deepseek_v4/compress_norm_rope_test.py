@@ -35,9 +35,8 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    PACKING, compress_norm_rope_store, pack_state_cache,
+    compress_norm_rope_store, pack_state_cache, quantize_fp8_ue8m0,
     shared_sparse_cache_shape, unpack_sparse_kv_cache)
-from tpu_inference.layers.common.quantization import quantize_tensor
 
 requires_tpu = pytest.mark.skipif(
     jax.devices()[0].platform != "tpu",
@@ -134,14 +133,9 @@ def compress_norm_rope_store_ref(
         nope = rotated[:nope_dim]
         rope = rotated[nope_dim:]
 
-        q, scale = quantize_tensor(
-            jnp.float8_e4m3fn,
-            jnp.asarray(nope[None]),
-            axis=-1,
-            block_size=quant_block,
-        )
+        q, scale = quantize_fp8_ue8m0(jnp.asarray(nope[None]), quant_block)
         q = np.asarray(q[0]).astype(ml_dtypes.float8_e4m3fn)
-        scale = np.asarray(scale)
+        scale = np.asarray(scale[0]).astype(np.float32)  # e8m0 -> f32 pow2
         rope_q = rope.astype(ml_dtypes.bfloat16)
 
         slot = int(kv_slot_mapping[t])

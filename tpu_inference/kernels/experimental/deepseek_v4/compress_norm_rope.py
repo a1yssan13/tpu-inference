@@ -25,8 +25,10 @@ logical caches overlay the same bytes (addressed by independent block tables,
 so their slot namespaces never collide):
 
 * Compressed KV -- written here, boundary tokens only, one row-slot per token.
-  The minor dim ``width`` = ``align_to(604, 128)`` = 640. The 604 used bytes are
-  ``[ nope 448 fp8 | rope 128 bf16 | scale 28 f32 ]`` and ``[604:640]`` is pad.
+  The minor dim ``width`` = ``align_to(583, 128)`` = 640. The 583 used bytes are
+  ``[ nope 448 fp8 | rope 128 bf16 | scale 7 e8m0 ]`` and ``[583:640]`` is pad.
+  The UE8M0 (power-of-two) block scales make the bytes alias the consuming
+  attention kernel (vllm-project/tpu-inference#2903).
 
 * Compressor state -- read here for the window pool. One state token spans
   ``page_size // state_block_size`` (=16) row-slots; each row-slot stores the
@@ -75,11 +77,33 @@ def _from_byte_lane(b: jax.Array, dtype) -> jax.Array:
     return jax.lax.bitcast_convert_type(grouped, dtype)
 
 
+def quantize_fp8_ue8m0(x: jax.Array, block_size: int):
+    """Block fp8 quantization with UE8M0 (power-of-two) block scales.
+
+    Matches the DeepSeek-V4 GPU Triton kernel and gxd's main-attention TPU
+    kernel (vllm-project/tpu-inference#2903): for each ``block_size`` chunk of
+    the trailing dim the scale is ``2 ** ceil(log2(amax / fp8_max))`` (``amax``
+    floored at 1e-4), values are scaled by its reciprocal and cast to
+    ``float8_e4m3fn``, and the scale is returned as ``float8_e8m0fnu`` -- one
+    byte per block whose value is ``exponent + 127``, the exact layout the
+    consuming attention kernel reads back.
+    """
+    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    *lead, dim = x.shape
+    blocked = x.reshape(*lead, dim // block_size, block_size)
+    amax = jnp.clip(
+        jnp.max(jnp.abs(blocked), axis=-1, keepdims=True), 1e-4, None)
+    scale = jnp.exp2(jnp.ceil(jnp.log2(amax / fp8_max)))
+    q = (blocked * (1.0 / scale)).astype(jnp.float8_e4m3fn).reshape(x.shape)
+    scale = jnp.squeeze(scale, -1).astype(jnp.float8_e8m0fnu)
+    return q, scale
+
+
 def sparse_packed_width(nope_dim: int, rope_head_dim: int,
                         quant_block: int) -> int:
     """Bytes per token in the packed sparse (head_dim=512) KV cache."""
-    # nope fp8 (1B) + rope bf16 (2B) + block-scale fp32 (4B)
-    return nope_dim + rope_head_dim * 2 + (nope_dim // quant_block) * 4
+    # nope fp8 (1B) + rope bf16 (2B) + UE8M0 block scale (1B)
+    return nope_dim + rope_head_dim * 2 + (nope_dim // quant_block)
 
 
 def indexer_packed_width(head_dim: int, quant_block: int) -> int:
@@ -89,13 +113,18 @@ def indexer_packed_width(head_dim: int, quant_block: int) -> int:
 
 def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
                            rope_head_dim: int, quant_block: int):
-    """Split the packed sparse KV cache into native-dtype component views."""
+    """Split the packed sparse KV cache into native-dtype component views.
+
+    The block scale is stored as UE8M0 (``float8_e8m0fnu``, one byte per
+    block) and returned as the equivalent power-of-two ``float32``.
+    """
     n_qb = nope_dim // quant_block
     a = nope_dim
     b = a + rope_head_dim * 2
     nope = _from_byte_lane(kv_cache[..., :a], jnp.float8_e4m3fn)
     rope = _from_byte_lane(kv_cache[..., a:b], jnp.bfloat16)
-    scale = _from_byte_lane(kv_cache[..., b:b + n_qb * 4], jnp.float32)
+    scale = _from_byte_lane(
+        kv_cache[..., b:b + n_qb], jnp.float8_e8m0fnu).astype(jnp.float32)
     return nope, rope, scale
 
 
@@ -353,7 +382,7 @@ def compress_norm_rope_store(
     * The compressed KV cache is written here (boundary tokens only) one
       row-slot per token, addressed by ``kv_slot_mapping`` at ``page_size``
       slots per page. Each record fills the minor dim ``width`` (=640) as
-      ``[ nope fp8 (448) | rope bf16 (128) | scale f32 (28) ]`` + pad.
+      ``[ nope fp8 (448) | rope bf16 (128) | scale e8m0 (7) ]`` + pad.
     """
     # state_dim packs [kv_state | score_state], each coff*head_dim wide.
     coff = 1 + int(overlap)
@@ -372,7 +401,6 @@ def compress_norm_rope_store(
     )
 
     compressed_pos = (positions // compress_ratio) * compress_ratio
-    # [T // m, 512] f32
     compressed = compress_norm_rope(
         kv_window=kv_window,
         score_window=score_window,
@@ -388,12 +416,12 @@ def compress_norm_rope_store(
     nope = compressed[..., :nope_dim]
     rope = compressed[..., nope_dim:]
 
-    q, scale = quantize_tensor(
-        jnp.float8_e4m3fn, nope, axis=-1, block_size=quant_block)
+    q, scale = quantize_fp8_ue8m0(nope, quant_block)
     rope_q = rope.astype(jnp.bfloat16)
 
-    # Per-token record [nope fp8 | rope bf16 | scale f32]; pad up to the cache's
-    # minor dim (640) -- the trailing bytes are unused alignment padding.
+    # Per-token record [nope fp8 | rope bf16 | UE8M0 scale]; pad up to the
+    # cache's minor dim (640). One e8m0 scale byte per block matches the
+    # consuming attention kernel (tpu-inference#2903), so the bytes alias.
     record = jnp.concatenate(
         [_to_byte_lane(q), _to_byte_lane(rope_q), _to_byte_lane(scale)],
         axis=-1)

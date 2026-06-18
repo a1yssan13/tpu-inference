@@ -27,11 +27,12 @@ Both paths consume identical inputs; their byte-packed (GPU) and paged (TPU)
 outputs are decoded back to fp32 ``[num_boundary_tokens, head_dim]`` and
 compared.
 
-The JAX kernels use ``quantize_tensor`` (absmax / ``finfo.max`` scales). The
-GPU Triton oracle still uses UE8M0 power-of-two scales and bf16 round-trips,
-so decoded outputs are compared semantically (per-token cosine + rel-L2), not
-bit-for-bit. Scale-exponent equality is not expected and those checks are
-skipped.
+The JAX sparse kernel now packs UE8M0 power-of-two block scales matching the
+GPU oracle (the indexer path still uses ``quantize_tensor`` absmax scales).
+Decoded outputs are still compared semantically (per-token cosine + rel-L2),
+not bit-for-bit, because Triton-interpret and JAX round fp8/bf16 differently.
+Exact per-block scale-exponent equality is still not asserted (rounding can
+shift an amax across a power-of-two boundary) and those checks stay skipped.
 
 GPU-oracle tests are marked ``gpu_oracle`` and skip automatically when triton
 / torch / the vLLM kernel are unavailable. Oracle-free invariant tests at the
@@ -551,11 +552,12 @@ def test_matches_gpu_triton_indexer_kernel(
 
 
 @pytest.mark.skip(
-    reason="JAX quantize_tensor scales differ from GPU UE8M0 exponents")
+    reason="sparse scales are now UE8M0 (gxd #2903 layout), but exact per-block"
+    " exponent equality can still shift +-1 under interpret-mode rounding")
 @requires_gpu_kernel
 @pytest.mark.gpu_oracle
 def test_gpu_and_tpu_sparse_scales_are_identical_exponents():
-    """GPU UE8M0 exponents vs JAX quantize_tensor scales (not comparable)."""
+    """GPU UE8M0 exponents vs JAX UE8M0 exponents (now the same scheme)."""
     kw = _make_inputs(128, False, seq_len=256, seed=11)
     slots = _boundary_slots(kw)
     nope_dim = kw["head_dim"] - kw["rope_head_dim"]
