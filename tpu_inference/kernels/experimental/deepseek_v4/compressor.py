@@ -17,7 +17,8 @@ import jax
 import jax.numpy as jnp
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store, compress_norm_rope_store_indexer)
+    compress_norm_rope_store, compress_norm_rope_store_indexer,
+    pack_state_cache, unpack_state_cache)
 from tpu_inference.kernels.experimental.deepseek_v4.compress_store import (
     save_partial_states)
 
@@ -62,9 +63,8 @@ def compressor_forward(
     block_table: jax.Array,         # [num_reqs, max_blocks] int
     token_to_req_indices: jax.Array,  # [num_tokens] int
     kv_slot_mapping: jax.Array,     # [num_tokens] int
-    state_cache: jax.Array,         # [num_blocks, block_size, 2*coff*head_dim] fp32
-    kv_cache: jax.Array,            # [kv_blocks, kv_block_size, packed_width] uint8
-    block_size: int,
+    cache: jax.Array,               # [num_pages, page_size//4, 4, width] uint8
+    state_block_size: int,
     head_dim: int,
     rope_head_dim: int,
     compress_ratio: int,
@@ -72,22 +72,34 @@ def compressor_forward(
     rms_eps: float,
     quant_block: int,
 ):
-    """head_dim=512 path: fp8 nope + bf16 rope packed into one uint8 KV cache."""
-    state_cache = _project_and_save(
-        hidden_states, wkv_wgate, ape, positions, state_cache, slot_mapping,
-        head_dim, overlap, compress_ratio)
+    """head_dim=512 path: state + compressed KV packed into one uint8 buffer.
 
-    kv_cache = compress_norm_rope_store(
-        state_cache=state_cache,
+    ``cache`` is the single shared buffer (see ``compress_norm_rope`` module
+    docstring). The compressor state is stored via the f32 view that
+    ``save_partial_states`` writes; the boundary stage then reads that view back
+    and writes the compressed KV record into the same buffer. The unchanged
+    ``save_partial_states`` kernel operates on the f32 view, so we round-trip
+    through ``unpack_state_cache`` / ``pack_state_cache`` around it.
+    """
+    coff = 1 + int(overlap)
+    state_dim = 2 * coff * head_dim
+
+    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+    state_view = _project_and_save(
+        hidden_states, wkv_wgate, ape, positions, state_view, slot_mapping,
+        head_dim, overlap, compress_ratio)
+    cache = pack_state_cache(cache, state_view)
+
+    cache = compress_norm_rope_store(
+        cache=cache,
         positions=positions,
         slot_mapping=slot_mapping,
         block_table=block_table,
         token_to_req_indices=token_to_req_indices,
         kv_slot_mapping=kv_slot_mapping,
-        kv_cache=kv_cache,
         rms_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
-        block_size=block_size,
+        state_block_size=state_block_size,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -96,7 +108,7 @@ def compressor_forward(
         quant_block=quant_block,
     )
 
-    return state_cache, kv_cache
+    return cache
 
 
 def compressor_forward_indexer(

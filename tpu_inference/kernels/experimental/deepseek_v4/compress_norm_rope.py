@@ -11,7 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compress, norm, RoPE, and store DeepSeek-V4 KV cache at compression boundaries."""
+"""Compress, norm, RoPE, store DeepSeek-V4 KV cache at compression boundaries.
+
+Shared cache layout (sparse / head_dim=512 path)
+-------------------------------------------------
+The compressor *state cache* and the compressed *KV cache* are collapsed into a
+single ``uint8`` ``jax.Array`` shaped like the MLA paged cache::
+
+    [num_pages, page_size // PACKING, PACKING, width]   # PACKING=4, width=640
+
+A page holds ``page_size`` (=64) KV row-slots of ``width`` (=640) bytes. Two
+logical caches overlay the same bytes (addressed by independent block tables,
+so their slot namespaces never collide):
+
+* Compressed KV -- written here, boundary tokens only, one row-slot per token.
+  The minor dim ``width`` = ``align_to(604, 128)`` = 640. The 604 used bytes are
+  ``[ nope 448 fp8 | rope 128 bf16 | scale 28 f32 ]`` and ``[604:640]`` is pad.
+
+* Compressor state -- read here for the window pool. One state token spans
+  ``page_size // state_block_size`` (=16) row-slots; each row-slot stores the
+  first 512 bytes (= 128 f32) of state and pads ``[512:640]``. So a state
+  token's ``state_dim`` (=2048) f32 values tile 16 row-slots x 128 f32.
+
+Move between the f32 state view and the shared byte buffer with
+``pack_state_cache`` / ``unpack_state_cache``; read the KV view with
+``unpack_sparse_kv_cache``. Byte (un)packing here uses ``bitcast_convert_type``;
+the production Pallas kernel will instead ``pltpu.bitcast`` VMEM tiles to avoid
+HBM relayouts.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -72,6 +99,85 @@ def unpack_indexer_kv_cache(kv_cache: jax.Array, head_dim: int,
     scale = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb * 4],
                             jnp.float32)
     return fp8, scale
+
+
+# uint8 lanes per 32-bit MLA word; the page's minor layout is [.., PACKING, w].
+PACKING = 4
+
+
+def _align_to(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def shared_sparse_cache_shape(num_pages: int, page_size: int, nope_dim: int,
+                              rope_head_dim: int, quant_block: int):
+    """MLA-style shape of the shared state+KV ``uint8`` buffer (sparse path).
+
+    Returns ``[num_pages, page_size // PACKING, PACKING, width]`` where
+    ``width = align_to(sparse_packed_width(...), 128)`` (= 640 for DeepSeek-V4
+    head_dim=512). See the module docstring for what the bytes hold.
+    """
+    width = _align_to(
+        sparse_packed_width(nope_dim, rope_head_dim, quant_block), 128)
+    return (num_pages, _align_to(page_size, PACKING) // PACKING, PACKING, width)
+
+
+def _state_chunk_dims(cache_shape, state_block_size: int, state_dim: int):
+    """Geometry of one state token tiled over the shared buffer's row-slots.
+
+    A state token's ``state_dim`` f32 values are split into ``rows_per_token``
+    chunks of ``f32_per_row`` f32 (= ``bytes_per_row`` bytes), one chunk per
+    KV row-slot; the rest of each ``width``-byte row-slot is padding.
+    """
+    num_pages, rows, packing, width = cache_shape
+    kv_slots = rows * packing
+    if kv_slots % state_block_size != 0:
+        raise ValueError(
+            f"page_size {kv_slots} not divisible by "
+            f"state_block_size {state_block_size}")
+    rows_per_token = kv_slots // state_block_size
+    if state_dim % rows_per_token != 0:
+        raise ValueError(
+            f"state_dim {state_dim} not divisible by "
+            f"rows_per_token {rows_per_token}")
+    f32_per_row = state_dim // rows_per_token
+    bytes_per_row = f32_per_row * 4
+    if bytes_per_row > width:
+        raise ValueError(
+            f"state row needs {bytes_per_row}B but cache width is {width}B")
+    return kv_slots, rows_per_token, f32_per_row, bytes_per_row
+
+
+def unpack_state_cache(cache: jax.Array, state_block_size: int,
+                       state_dim: int) -> jax.Array:
+    """Read the shared buffer's f32 state view ``[num_pages, sb, state_dim]``.
+
+    Inverse of ``pack_state_cache``. Only the leading ``bytes_per_row`` of each
+    row-slot carry state; trailing pad bytes are ignored.
+    """
+    num_pages, rows, packing, width = cache.shape
+    kv_slots, rpt, fpr, bpr = _state_chunk_dims(
+        cache.shape, state_block_size, state_dim)
+    slots = cache.reshape(num_pages, kv_slots, width)
+    chunk = slots[:, :, :bpr].reshape(num_pages, state_block_size, rpt, bpr)
+    f32 = _from_byte_lane(chunk, jnp.float32)  # [num_pages, sb, rpt, fpr]
+    return f32.reshape(num_pages, state_block_size, state_dim)
+
+
+def pack_state_cache(cache: jax.Array, state: jax.Array) -> jax.Array:
+    """Write an f32 state view ``[num_pages, sb, state_dim]`` into ``cache``.
+
+    Inverse of ``unpack_state_cache``; leaves each row-slot's pad bytes (and the
+    KV-only row-slots) untouched.
+    """
+    num_pages, rows, packing, width = cache.shape
+    sb, state_dim = state.shape[1], state.shape[2]
+    kv_slots, rpt, fpr, bpr = _state_chunk_dims(cache.shape, sb, state_dim)
+    chunk = state.reshape(num_pages, sb, rpt, fpr)
+    chunk_bytes = _to_byte_lane(chunk).reshape(num_pages, kv_slots, bpr)
+    slots = cache.reshape(num_pages, kv_slots, width)
+    slots = slots.at[:, :, :bpr].set(chunk_bytes)
+    return slots.reshape(num_pages, rows, packing, width)
 
 
 def interleaved_rope(
@@ -183,16 +289,15 @@ def _boundary_dest(
 
 
 def compress_norm_rope_store(
-    state_cache: jax.Array,         # [num_blocks, block_size, 2*state_width] fp32
+    cache: jax.Array,               # [num_pages, page_size//4, 4, width] uint8
     positions: jax.Array,           # [num_tokens] int
     slot_mapping: jax.Array,        # [num_tokens] int (state-cache slots)
-    block_table: jax.Array,         # [num_reqs, max_blocks] int (STATE cache)
+    block_table: jax.Array,         # [num_reqs, max_blocks] int (state pages)
     token_to_req_indices: jax.Array,  # [num_tokens] int
     kv_slot_mapping: jax.Array,     # [num_tokens] int (compressed-KV slots)
-    kv_cache: jax.Array,            # [num_blocks, block_size, packed_width] uint8
     rms_weight: jax.Array,          # [head_dim] fp32
     cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32
-    block_size: int,
+    state_block_size: int,
     head_dim: int,
     rope_head_dim: int,
     compress_ratio: int,
@@ -200,19 +305,31 @@ def compress_norm_rope_store(
     rms_eps: float,
     quant_block: int,
 ):
-    """Store each boundary token's compressed KV as one packed record.
+    """Compress a window, then store the result into the shared state+KV cache.
 
-    Record layout along ``kv_cache``'s minor dim:
-    ``[nope fp8 | rope bf16 | block-scale fp32]``.
+    ``cache`` is one ``uint8`` buffer ``[num_pages, page_size//4, 4, width]``
+    that overlays two logical caches on the same bytes (see module docstring):
 
-    TODO(kv-cache-aliasing): make different caches share one memory buffer.
+    * The compressor state cache is read here for the window pool, via the f32
+      view from ``unpack_state_cache``. ``block_table`` / ``slot_mapping``
+      address it at ``state_block_size`` tokens per page; each state token spans
+      ``page_size // state_block_size`` row-slots.
+    * The compressed KV cache is written here (boundary tokens only) one
+      row-slot per token, addressed by ``kv_slot_mapping`` at ``page_size``
+      slots per page. Each record fills the minor dim ``width`` (=640) as
+      ``[ nope fp8 (448) | rope bf16 (128) | scale f32 (28) ]`` + pad.
     """
+    # state_dim packs [kv_state | score_state], each coff*head_dim wide.
+    coff = 1 + int(overlap)
+    state_dim = 2 * coff * head_dim
+    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+
     kv_window, score_window, valid_mask = gather_state_windows(
-        state_cache=state_cache,
+        state_cache=state_view,
         positions=positions,
         block_table=block_table,
         token_to_req_indices=token_to_req_indices,
-        block_size=block_size,
+        block_size=state_block_size,
         head_dim=head_dim,
         compress_ratio=compress_ratio,
         overlap=overlap,
@@ -238,19 +355,27 @@ def compress_norm_rope_store(
         jnp.float8_e4m3fn, nope, axis=-1, block_size=quant_block)
     rope_q = rope.astype(jnp.bfloat16)
 
-    # Pack [nope fp8 | rope bf16 | scale fp32] into per-token uint8 records.
-    packed = jnp.concatenate(
+    # Per-token record [nope fp8 | rope bf16 | scale f32]; pad up to the cache's
+    # minor dim (640) -- the trailing bytes are unused alignment padding.
+    record = jnp.concatenate(
         [_to_byte_lane(q), _to_byte_lane(rope_q), _to_byte_lane(scale)],
         axis=-1)
 
-    num_blocks, blk, packed_width = kv_cache.shape
-    num_slots = num_blocks * blk
+    num_pages, rows, packing, width = cache.shape
+    pad = width - record.shape[-1]
+    if pad < 0:
+        raise ValueError(
+            f"packed record {record.shape[-1]}B exceeds cache width {width}B")
+    record = jnp.pad(record, ((0, 0), (0, pad)))
+
+    # Flatten pages x (rows x packing) -> KV row-slots, then scatter boundary
+    # tokens; non-boundary / padded tokens map past the end and are dropped.
+    num_slots = num_pages * rows * packing
     dest = _boundary_dest(positions, slot_mapping, kv_slot_mapping,
                           compress_ratio, num_slots)
-
-    flat = kv_cache.reshape(num_slots, packed_width)
-    flat = flat.at[dest].set(packed, mode="drop")
-    return flat.reshape(num_blocks, blk, packed_width)
+    flat = cache.reshape(num_slots, width)
+    flat = flat.at[dest].set(record, mode="drop")
+    return flat.reshape(num_pages, rows, packing, width)
 
 
 def compress_norm_rope_store_indexer(

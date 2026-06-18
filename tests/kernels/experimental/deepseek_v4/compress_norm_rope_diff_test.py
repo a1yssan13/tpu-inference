@@ -57,9 +57,12 @@ import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
     compress_norm_rope_store, compress_norm_rope_store_indexer,
-    indexer_packed_width, interleaved_rope, sparse_packed_width,
-    unpack_indexer_kv_cache, unpack_sparse_kv_cache)
+    indexer_packed_width, interleaved_rope, pack_state_cache,
+    shared_sparse_cache_shape, unpack_indexer_kv_cache, unpack_sparse_kv_cache)
 from tpu_inference.layers.common.quantization import quantize_tensor
+
+# KV row-slots per shared-cache page (the MLA storage block size).
+PAGE_SIZE = 64
 
 # Triton (imported lazily in ``_load_gpu_kernels``) must run in interpret mode
 # so the GPU kernel executes on CPU. Set before any triton import happens.
@@ -214,19 +217,19 @@ def _decode_gpu(byte_cache, slots, kv_blk, token_stride, scale_dim, nope_dim,
     return out
 
 
-def _decode_tpu(kv_cache, slots, kv_blk, quant_block, nope_dim,
-                rope_head_dim):
-    """Decode the JAX packed sparse KV cache for the given KV slots."""
+def _decode_tpu(kv_cache, slots, quant_block, nope_dim, rope_head_dim):
+    """Decode the JAX packed sparse KV cache (shared buffer) by flat KV slot."""
+    n_qb = nope_dim // quant_block
     nope_c, rope_c, scale_c = unpack_sparse_kv_cache(
         kv_cache, nope_dim, rope_head_dim, quant_block)
-    nope = np.asarray(nope_c).astype(np.float32)
-    rope = np.asarray(rope_c).astype(np.float32)
-    scale = np.asarray(scale_c).astype(np.float32)
+    nope = np.asarray(nope_c).reshape(-1, nope_dim).astype(np.float32)
+    rope = np.asarray(rope_c).reshape(-1, rope_head_dim).astype(np.float32)
+    scale = np.asarray(scale_c).reshape(-1, n_qb).astype(np.float32)
     out = np.zeros((len(slots), nope_dim + rope_head_dim), np.float32)
     for i, slot in enumerate(slots):
-        b, p = divmod(int(slot), kv_blk)
-        out[i, :nope_dim] = nope[b, p] * np.repeat(scale[b, p], quant_block)
-        out[i, nope_dim:] = rope[b, p]
+        s = int(slot)
+        out[i, :nope_dim] = nope[s] * np.repeat(scale[s], quant_block)
+        out[i, nope_dim:] = rope[s]
     return out
 
 
@@ -323,21 +326,37 @@ def _run_tpu(kw):
     rope_head_dim = kw["rope_head_dim"]
     quant_block = kw["quant_block"]
     nope_dim = head_dim - rope_head_dim
-    packed_width = sparse_packed_width(nope_dim, rope_head_dim, quant_block)
-    kv_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], packed_width), dtype=np.uint8)
+
+    state_cache = kw["state_cache"]            # [num_blocks, bs, state_dim] f32
+    num_blocks, state_block_size, state_dim = state_cache.shape
+
+    # One shared buffer must span both the state pages (via block_table) and
+    # all KV slots (via kv_slot_mapping). Boundary writes may overlap state
+    # pages, but the gather reads pre-write state, so the result is unaffected.
+    min_kv_pages = -(-(kw["kv_num_blocks"] * kw["kv_blk"]) // PAGE_SIZE)
+    num_pages = max(num_blocks, min_kv_pages)
+
+    cache_shape = shared_sparse_cache_shape(
+        num_pages, PAGE_SIZE, nope_dim, rope_head_dim, quant_block)
+    cache = np.zeros(cache_shape, dtype=np.uint8)
+
+    # Pack the same f32 state the GPU kernel reads into the shared buffer.
+    padded_state = np.zeros(
+        (num_pages, state_block_size, state_dim), dtype=np.float32)
+    padded_state[:num_blocks] = state_cache
+    cache = pack_state_cache(
+        jax.numpy.asarray(cache), jax.numpy.asarray(padded_state))
 
     return compress_norm_rope_store(
-        state_cache=jax.numpy.asarray(kw["state_cache"]),
+        cache=cache,
         positions=jax.numpy.asarray(kw["positions"]),
         slot_mapping=jax.numpy.asarray(kw["slot_mapping"]),
         block_table=jax.numpy.asarray(kw["block_table"]),
         token_to_req_indices=jax.numpy.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jax.numpy.asarray(kw["kv_slot_mapping"]),
-        kv_cache=jax.numpy.asarray(kv_cache),
         rms_weight=jax.numpy.asarray(kw["rms_weight"]),
         cos_sin_cache=jax.numpy.asarray(kw["cos_sin_cache"]),
-        block_size=kw["block_size"], head_dim=head_dim,
+        state_block_size=state_block_size, head_dim=head_dim,
         rope_head_dim=rope_head_dim, compress_ratio=kw["compress_ratio"],
         overlap=kw["overlap"], rms_eps=kw["rms_eps"], quant_block=quant_block)
 
@@ -468,8 +487,7 @@ def test_matches_gpu_triton_sparse_kernel(
         byte_cache, slots, kw["kv_blk"], token_stride, scale_dim, nope_dim,
         kw["rope_head_dim"], kw["quant_block"])
     tpu = _decode_tpu(
-        tpu_kv, slots, kw["kv_blk"], kw["quant_block"], nope_dim,
-        kw["rope_head_dim"])
+        tpu_kv, slots, kw["quant_block"], nope_dim, kw["rope_head_dim"])
 
     # The nope head is fp8 (3 mantissa bits) and Triton's interpret-mode fp8
     # cast rounds differently from JAX's by up to ~1 ULP/element (see the
