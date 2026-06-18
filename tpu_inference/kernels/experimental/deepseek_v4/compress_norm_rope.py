@@ -38,6 +38,14 @@ Move between the f32 state view and the shared byte buffer with
 ``unpack_sparse_kv_cache``. Byte (un)packing here uses ``bitcast_convert_type``;
 the production Pallas kernel will instead ``pltpu.bitcast`` VMEM tiles to avoid
 HBM relayouts.
+
+Shared cache layout (indexer / head_dim=128 path)
+-------------------------------------------------
+The lightning indexer overlays the same way via ``shared_indexer_cache_shape``,
+only the byte sizes differ: ``width = align_to(132, 128) = 256``. A KV record is
+``[ fp8 128 | scale 4 f32 ] + pad`` and one state token (``state_dim`` f32) tiles
+``page_size // state_block_size`` row-slots. The same ``pack_state_cache`` /
+``unpack_state_cache`` helpers and ``unpack_indexer_kv_cache`` apply.
 """
 
 import jax
@@ -122,6 +130,18 @@ def shared_sparse_cache_shape(num_pages: int, page_size: int, nope_dim: int,
     return (num_pages, _align_to(page_size, PACKING) // PACKING, PACKING, width)
 
 
+def shared_indexer_cache_shape(num_pages: int, page_size: int, head_dim: int,
+                               quant_block: int):
+    """MLA-style shape of the shared state+KV ``uint8`` buffer (indexer path).
+
+    Same layout as ``shared_sparse_cache_shape`` but sized for the indexer
+    record: ``width = align_to(indexer_packed_width(...), 128)`` (= 256 for
+    DeepSeek-V4 head_dim=128). See the module docstring for the byte map.
+    """
+    width = _align_to(indexer_packed_width(head_dim, quant_block), 128)
+    return (num_pages, _align_to(page_size, PACKING) // PACKING, PACKING, width)
+
+
 def _state_chunk_dims(cache_shape, state_block_size: int, state_dim: int):
     """Geometry of one state token tiled over the shared buffer's row-slots.
 
@@ -156,7 +176,10 @@ def unpack_state_cache(cache: jax.Array, state_block_size: int,
     row-slot carry state; trailing pad bytes are ignored.
     """
     num_pages, rows, packing, width = cache.shape
-    kv_slots, rpt, fpr, bpr = _state_chunk_dims(
+    # 64 tokens/page (rows * packing)
+    # 16 rows_per_token (64 / 4)
+    # 512 bytes per row (640 - 512 bytes of padding)
+    kv_slots, rpt, _, bpr = _state_chunk_dims(
         cache.shape, state_block_size, state_dim)
     slots = cache.reshape(num_pages, kv_slots, width)
     chunk = slots[:, :, :bpr].reshape(num_pages, state_block_size, rpt, bpr)
@@ -231,8 +254,10 @@ def compress_norm_rope(
     masked_score = jnp.where(valid_mask[..., None], score_window, neg_inf)
     weights = jax.nn.softmax(masked_score, axis=1)
 
-    compressed_kv = jnp.sum(weights * kv_window, axis=1)
+    compressed_kv = jnp.sum(weights * kv_window, axis=1) # [num_tokens, head_dim]
 
+    # RMSNorm over head_dim. variance: [num_tokens, 1];
+    # normed: [num_tokens, head_dim].
     variance = jnp.mean(jnp.square(compressed_kv), axis=-1, keepdims=True)
     normed = compressed_kv * jax.lax.rsqrt(variance + rms_eps) * rms_weight
 
@@ -250,7 +275,15 @@ def gather_state_windows(
     compress_ratio: int,
     overlap: bool,
 ):
-    """Gather ``[kv_window, score_window, valid_mask]`` from the paged cache."""
+    """
+    Gather ``[kv_window, score_window, valid_mask]`` from the paged cache.
+
+    Returns:
+      kv_window: [token, window, head_dim] -- partial kv vectors to pool 
+      score_window: [tokens, window, head_dim] -- scores for softmax weight
+      valid_mask: [token, window] -- False where window goes before seq start.
+    
+    """
     coff = 1 + int(overlap)
     state_width = coff * head_dim
     window = coff * compress_ratio
@@ -266,7 +299,10 @@ def gather_state_windows(
     block_offsets = safe_pos % block_size
 
     # C4 overlap: slots >= compress_ratio read the second head slice.
+    # head_offset = 512 if w_idx >= compress_ratio else 0
+    # this is because last dimension is 2 * state_width (2048)
     head_offset = (w_idx >= compress_ratio).astype(jnp.int32) * head_dim
+    # cols = head_offset + [0..511]
     col = head_offset[None, :, None] + jnp.arange(head_dim)[None, None, :]
 
     bn = block_numbers[:, :, None]
@@ -336,6 +372,7 @@ def compress_norm_rope_store(
     )
 
     compressed_pos = (positions // compress_ratio) * compress_ratio
+    # [T // m, 512] f32
     compressed = compress_norm_rope(
         kv_window=kv_window,
         score_window=score_window,
@@ -379,16 +416,15 @@ def compress_norm_rope_store(
 
 
 def compress_norm_rope_store_indexer(
-    state_cache: jax.Array,         # [num_blocks, block_size, 2*state_width] fp32
+    cache: jax.Array,               # [num_pages, page_size//4, 4, width] uint8
     positions: jax.Array,           # [num_tokens] int
     slot_mapping: jax.Array,        # [num_tokens] int (state-cache slots)
-    block_table: jax.Array,         # [num_reqs, max_blocks] int (STATE cache)
+    block_table: jax.Array,         # [num_reqs, max_blocks] int (state pages)
     token_to_req_indices: jax.Array,  # [num_tokens] int
     kv_slot_mapping: jax.Array,     # [num_tokens] int (indexer-KV slots)
-    kv_cache: jax.Array,            # [num_blocks, block_size, packed_width] uint8
     rms_weight: jax.Array,          # [head_dim] fp32
     cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32
-    block_size: int,
+    state_block_size: int,
     head_dim: int,
     rope_head_dim: int,
     compress_ratio: int,
@@ -396,19 +432,29 @@ def compress_norm_rope_store_indexer(
     rms_eps: float,
     quant_block: int,
 ):
-    """Store each boundary token's compressed KV as one packed record.
+    """Indexer (head_dim=128) twin of ``compress_norm_rope_store``.
 
-    Record layout along ``kv_cache``'s minor dim: ``[fp8 | scale fp32]``.
+    ``cache`` is one ``uint8`` buffer ``[num_pages, page_size//4, 4, width]``
+    (see ``shared_indexer_cache_shape``) overlaying two logical caches:
 
-    TODO(kv-cache-aliasing): the wired vLLM model plans the indexer
-    ``state_cache`` and this ``kv_cache`` onto one physical memory buffer.
+    * The indexer state cache is read for the window pool via the f32 view from
+      ``unpack_state_cache``, addressed by ``block_table`` / ``slot_mapping`` at
+      ``state_block_size`` tokens per page.
+    * The compressed indexer KV cache is written (boundary tokens only) one
+      row-slot per token, addressed by ``kv_slot_mapping``. Each record fills
+      the minor dim ``width`` (=256) as ``[ fp8 (128) | scale f32 (4) ]`` + pad.
     """
+    # state_dim packs [kv_state | score_state], each coff*head_dim wide.
+    coff = 1 + int(overlap)
+    state_dim = 2 * coff * head_dim
+    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+
     kv_window, score_window, valid_mask = gather_state_windows(
-        state_cache=state_cache,
+        state_cache=state_view,
         positions=positions,
         block_table=block_table,
         token_to_req_indices=token_to_req_indices,
-        block_size=block_size,
+        block_size=state_block_size,
         head_dim=head_dim,
         compress_ratio=compress_ratio,
         overlap=overlap,
@@ -429,15 +475,20 @@ def compress_norm_rope_store_indexer(
     q, scale = quantize_tensor(
         jnp.float8_e4m3fn, compressed, axis=-1, block_size=quant_block)
 
-    # Pack [fp8 | scale fp32] into per-token uint8 records.
-    packed = jnp.concatenate(
+    # Per-token record [fp8 | scale f32]; pad up to the cache's minor dim.
+    record = jnp.concatenate(
         [_to_byte_lane(q), _to_byte_lane(scale)], axis=-1)
 
-    num_blocks, blk, packed_width = kv_cache.shape
-    num_slots = num_blocks * blk
+    num_pages, rows, packing, width = cache.shape
+    pad = width - record.shape[-1]
+    if pad < 0:
+        raise ValueError(
+            f"packed record {record.shape[-1]}B exceeds cache width {width}B")
+    record = jnp.pad(record, ((0, 0), (0, pad)))
+
+    num_slots = num_pages * rows * packing
     dest = _boundary_dest(positions, slot_mapping, kv_slot_mapping,
                           compress_ratio, num_slots)
-
-    flat = kv_cache.reshape(num_slots, packed_width)
-    flat = flat.at[dest].set(packed, mode="drop")
-    return flat.reshape(num_blocks, blk, packed_width)
+    flat = cache.reshape(num_slots, width)
+    flat = flat.at[dest].set(record, mode="drop")
+    return flat.reshape(num_pages, rows, packing, width)

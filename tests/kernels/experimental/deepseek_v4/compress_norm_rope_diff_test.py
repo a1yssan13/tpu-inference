@@ -57,7 +57,7 @@ import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
     compress_norm_rope_store, compress_norm_rope_store_indexer,
-    indexer_packed_width, interleaved_rope, pack_state_cache,
+    interleaved_rope, pack_state_cache, shared_indexer_cache_shape,
     shared_sparse_cache_shape, unpack_indexer_kv_cache, unpack_sparse_kv_cache)
 from tpu_inference.layers.common.quantization import quantize_tensor
 
@@ -255,15 +255,16 @@ def _decode_gpu_indexer(byte_cache, slots, kv_blk, token_stride, scale_dim):
     return out
 
 
-def _decode_tpu_indexer(kv_cache, slots, kv_blk, head_dim, quant_block):
-    """Decode the JAX packed indexer cache (fp8 + single fp32 scale)."""
+def _decode_tpu_indexer(kv_cache, slots, head_dim, quant_block):
+    """Decode the JAX packed indexer cache (shared buffer) by flat KV slot."""
+    n_qb = head_dim // quant_block
     fp8_c, scale_c = unpack_indexer_kv_cache(kv_cache, head_dim, quant_block)
-    fp8 = np.asarray(fp8_c).astype(np.float32)
-    scale = np.asarray(scale_c).astype(np.float32)
+    fp8 = np.asarray(fp8_c).reshape(-1, head_dim).astype(np.float32)
+    scale = np.asarray(scale_c).reshape(-1, n_qb).astype(np.float32)
     out = np.zeros((len(slots), head_dim), np.float32)
     for i, slot in enumerate(slots):
-        b, p = divmod(int(slot), kv_blk)
-        out[i] = fp8[b, p] * scale[b, p, 0]
+        s = int(slot)
+        out[i] = fp8[s] * scale[s, 0]
     return out
 
 
@@ -414,21 +415,35 @@ def _run_gpu_indexer(kw):
 def _run_tpu_indexer(kw):
     head_dim = kw["head_dim"]
     quant_block = kw["quant_block"]
-    packed_width = indexer_packed_width(head_dim, quant_block)
-    kv_cache = np.zeros(
-        (kw["kv_num_blocks"], kw["kv_blk"], packed_width), dtype=np.uint8)
+
+    state_cache = kw["state_cache"]            # [num_blocks, bs, state_dim] f32
+    num_blocks, state_block_size, state_dim = state_cache.shape
+
+    # One shared buffer spanning both state pages (via block_table) and all KV
+    # slots (via kv_slot_mapping); see ``_run_tpu`` for why the overlap is safe.
+    min_kv_pages = -(-(kw["kv_num_blocks"] * kw["kv_blk"]) // PAGE_SIZE)
+    num_pages = max(num_blocks, min_kv_pages)
+
+    cache_shape = shared_indexer_cache_shape(
+        num_pages, PAGE_SIZE, head_dim, quant_block)
+    cache = np.zeros(cache_shape, dtype=np.uint8)
+
+    padded_state = np.zeros(
+        (num_pages, state_block_size, state_dim), dtype=np.float32)
+    padded_state[:num_blocks] = state_cache
+    cache = pack_state_cache(
+        jax.numpy.asarray(cache), jax.numpy.asarray(padded_state))
 
     return compress_norm_rope_store_indexer(
-        state_cache=jax.numpy.asarray(kw["state_cache"]),
+        cache=cache,
         positions=jax.numpy.asarray(kw["positions"]),
         slot_mapping=jax.numpy.asarray(kw["slot_mapping"]),
         block_table=jax.numpy.asarray(kw["block_table"]),
         token_to_req_indices=jax.numpy.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jax.numpy.asarray(kw["kv_slot_mapping"]),
-        kv_cache=jax.numpy.asarray(kv_cache),
         rms_weight=jax.numpy.asarray(kw["rms_weight"]),
         cos_sin_cache=jax.numpy.asarray(kw["cos_sin_cache"]),
-        block_size=kw["block_size"], head_dim=head_dim,
+        state_block_size=state_block_size, head_dim=head_dim,
         rope_head_dim=kw["rope_head_dim"], compress_ratio=kw["compress_ratio"],
         overlap=kw["overlap"], rms_eps=kw["rms_eps"], quant_block=quant_block)
 
@@ -527,7 +542,7 @@ def test_matches_gpu_triton_indexer_kernel(
     gpu = _decode_gpu_indexer(
         byte_cache, slots, kw["kv_blk"], token_stride, scale_dim)
     tpu = _decode_tpu_indexer(
-        tpu_kv, slots, kw["kv_blk"], kw["head_dim"], kw["quant_block"])
+        tpu_kv, slots, kw["head_dim"], kw["quant_block"])
 
     # Whole head is fp8 (rope tail included); interpret-mode rounding applies
     # to all 128 dims, so use the same relaxed tolerance as the sparse nope.

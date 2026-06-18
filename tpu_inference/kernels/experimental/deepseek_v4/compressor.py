@@ -38,8 +38,9 @@ def _project_and_save(
     state_width = coff * head_dim
 
     kv_score = hidden_states.astype(jnp.float32) @ wkv_wgate.T
-    kv = kv_score[:, :state_width]
-    score = kv_score[:, state_width:2 * state_width]
+    # [num_tokens, 2 * coff * head_dim]
+    kv = kv_score[:, :state_width] # [num_tokens, coff * head_dim]
+    score = kv_score[:, state_width:2 * state_width] # [num_tokens, coff * head_dim]
 
     return save_partial_states(
         kv=kv,
@@ -54,40 +55,52 @@ def _project_and_save(
 
 def compressor_forward(
     hidden_states: jax.Array,       # [num_tokens, hidden_size] fp32
-    wkv_wgate: jax.Array,           # [2 * coff * head_dim, hidden_size] fp32
-    ape: jax.Array,                 # [compress_ratio, coff * head_dim] fp32
-    norm_weight: jax.Array,         # [head_dim] fp32
-    cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32
-    positions: jax.Array,           # [num_tokens] int
-    slot_mapping: jax.Array,        # [num_tokens] int
-    block_table: jax.Array,         # [num_reqs, max_blocks] int
-    token_to_req_indices: jax.Array,  # [num_tokens] int
-    kv_slot_mapping: jax.Array,     # [num_tokens] int
+    wkv_wgate: jax.Array,           # [2*coff*head_dim, hidden_size] fp32
+    ape: jax.Array,                 # [compress_ratio, coff*head_dim] fp32
+    norm_weight: jax.Array,         # [head_dim] fp32 RMSNorm gamma
+    cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32 RoPE table
+    positions: jax.Array,           # [num_tokens] int logical pos per token
+    slot_mapping: jax.Array,        # [num_tokens] int flat state-cache slot
+    block_table: jax.Array,         # [num_reqs, max_blocks] int state pages
+    token_to_req_indices: jax.Array,  # [num_tokens] int req id per token
+    kv_slot_mapping: jax.Array,     # [num_tokens] int flat compressed-KV slot
     cache: jax.Array,               # [num_pages, page_size//4, 4, width] uint8
-    state_block_size: int,
-    head_dim: int,
-    rope_head_dim: int,
-    compress_ratio: int,
-    overlap: bool,
+    state_block_size: int,          # state tokens per page (4=C4, 8=C128)
+    head_dim: int,                  # 512 for sparse CSA/HCA main path
+    rope_head_dim: int,             # 64; trailing dims get interleaved RoPE
+    compress_ratio: int,            # 4 (CSA) or 128 (HCA); boundary stride
+    overlap: bool,                  # True for C4 (two head slices per state row)
     rms_eps: float,
-    quant_block: int,
+    quant_block: int,                # fp8 absmax block along nope (64)
 ):
-    """head_dim=512 path: state + compressed KV packed into one uint8 buffer.
+    """head_dim=512 path: project, save state, compress, store into one buffer.
 
-    ``cache`` is the single shared buffer (see ``compress_norm_rope`` module
-    docstring). The compressor state is stored via the f32 view that
-    ``save_partial_states`` writes; the boundary stage then reads that view back
-    and writes the compressed KV record into the same buffer. The unchanged
-    ``save_partial_states`` kernel operates on the f32 view, so we round-trip
-    through ``unpack_state_cache`` / ``pack_state_cache`` around it.
+    Two logical caches overlay ``cache`` (see ``compress_norm_rope`` docstring):
+
+    * **State cache** (read/write every token): partial ``[kv | score+ape]``
+      f32 rows. Addressed by ``slot_mapping`` at ``state_block_size`` tokens
+      per page; ``block_table`` maps logical positions to state pages for the
+      boundary window gather. ``slot_mapping < 0`` skips padded tokens.
+    * **Compressed KV cache** (write boundary tokens only): packed
+      ``[nope fp8 | rope bf16 | scale f32]`` uint8 records, one row-slot per
+      token. Addressed by ``kv_slot_mapping`` at ``page_size`` (=64) slots
+      per page; only tokens where ``(position + 1) % compress_ratio == 0`` are
+      stored.
+
+    Stage 1 (``save_partial_states``) still expects the f32 state view
+    ``[num_pages, state_block_size, state_dim]``, so we round-trip through
+    ``unpack_state_cache`` / ``pack_state_cache`` around it.
     """
     coff = 1 + int(overlap)
     state_dim = 2 * coff * head_dim
 
+    # (num_pages, 16, 4, 640) uint8 -> return view of (num_pages, 4, 16 x 128) fp32 
     state_view = unpack_state_cache(cache, state_block_size, state_dim)
     state_view = _project_and_save(
         hidden_states, wkv_wgate, ape, positions, state_view, slot_mapping,
         head_dim, overlap, compress_ratio)
+    # put view (num_pages, state_block_size=4, 16 x 128) fp32 back to state:
+    # (num_pages, 16, 4, 640) uint8
     cache = pack_state_cache(cache, state_view)
 
     cache = compress_norm_rope_store(
@@ -113,41 +126,49 @@ def compressor_forward(
 
 def compressor_forward_indexer(
     hidden_states: jax.Array,       # [num_tokens, hidden_size] fp32
-    wkv_wgate: jax.Array,           # [2 * coff * head_dim, hidden_size] fp32
-    ape: jax.Array,                 # [compress_ratio, coff * head_dim] fp32
-    norm_weight: jax.Array,         # [head_dim] fp32
-    cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32
-    positions: jax.Array,           # [num_tokens] int
-    slot_mapping: jax.Array,        # [num_tokens] int
-    block_table: jax.Array,         # [num_reqs, max_blocks] int
-    token_to_req_indices: jax.Array,  # [num_tokens] int
-    kv_slot_mapping: jax.Array,     # [num_tokens] int
-    state_cache: jax.Array,         # [num_blocks, block_size, 2*coff*head_dim] fp32
-    kv_cache: jax.Array,            # [kv_blocks, kv_block_size, packed_width] uint8
-    block_size: int,
-    head_dim: int,
-    rope_head_dim: int,
-    compress_ratio: int,
-    overlap: bool,
+    wkv_wgate: jax.Array,           # [2*coff*head_dim, hidden_size] fp32
+    ape: jax.Array,                 # [compress_ratio, coff*head_dim] fp32
+    norm_weight: jax.Array,         # [head_dim] fp32 RMSNorm gamma
+    cos_sin_cache: jax.Array,       # [max_pos, rope_head_dim] fp32 RoPE table
+    positions: jax.Array,           # [num_tokens] int logical pos per token
+    slot_mapping: jax.Array,        # [num_tokens] int flat state-cache slot
+    block_table: jax.Array,         # [num_reqs, max_blocks] int state pages
+    token_to_req_indices: jax.Array,  # [num_tokens] int req id per token
+    kv_slot_mapping: jax.Array,     # [num_tokens] int flat indexer-KV slot
+    cache: jax.Array,               # [num_pages, page_size//4, 4, width] uint8
+    state_block_size: int,          # indexer state tokens per page
+    head_dim: int,                  # 128 for the indexer path
+    rope_head_dim: int,             # 64; trailing dims get interleaved RoPE
+    compress_ratio: int,            # 4 (CSA) or 128 (HCA); boundary stride
+    overlap: bool,                  # True for C4 (two head slices per state row)
     rms_eps: float,
-    quant_block: int,
+    quant_block: int,                # whole-head fp8 absmax block (128)
 ):
-    """head_dim=128 indexer path: whole-head fp8 + one scale, one uint8 cache."""
-    state_cache = _project_and_save(
-        hidden_states, wkv_wgate, ape, positions, state_cache, slot_mapping,
-        head_dim, overlap, compress_ratio)
+    """head_dim=128 indexer path: state + compressed KV in one uint8 buffer.
 
-    kv_cache = compress_norm_rope_store_indexer(
-        state_cache=state_cache,
+    Indexer twin of ``compressor_forward``; the only differences are the record
+    layout (whole-head fp8 + a single scale) and the smaller ``width``. See that
+    function and the ``compress_norm_rope`` module docstring for the overlay.
+    """
+    coff = 1 + int(overlap)
+    state_dim = 2 * coff * head_dim
+
+    state_view = unpack_state_cache(cache, state_block_size, state_dim)
+    state_view = _project_and_save(
+        hidden_states, wkv_wgate, ape, positions, state_view, slot_mapping,
+        head_dim, overlap, compress_ratio)
+    cache = pack_state_cache(cache, state_view)
+
+    cache = compress_norm_rope_store_indexer(
+        cache=cache,
         positions=positions,
         slot_mapping=slot_mapping,
         block_table=block_table,
         token_to_req_indices=token_to_req_indices,
         kv_slot_mapping=kv_slot_mapping,
-        kv_cache=kv_cache,
         rms_weight=norm_weight,
         cos_sin_cache=cos_sin_cache,
-        block_size=block_size,
+        state_block_size=state_block_size,
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
@@ -156,4 +177,4 @@ def compressor_forward_indexer(
         quant_block=quant_block,
     )
 
-    return state_cache, kv_cache
+    return cache

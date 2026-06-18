@@ -29,7 +29,8 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store_indexer, indexer_packed_width)
+    compress_norm_rope_store_indexer, pack_state_cache,
+    shared_indexer_cache_shape, unpack_state_cache)
 from tpu_inference.kernels.experimental.deepseek_v4.compress_store import (
     save_partial_states)
 from tpu_inference.kernels.experimental.deepseek_v4.compressor import (
@@ -40,6 +41,9 @@ requires_tpu = pytest.mark.skipif(
     reason="requires a TPU backend",
 )
 
+# KV row-slots per shared-cache page (the MLA storage block size).
+PAGE_SIZE = 64
+
 
 def _make_inputs(
     compress_ratio, overlap, head_dim=128, rope_head_dim=64, quant_block=128,
@@ -49,15 +53,21 @@ def _make_inputs(
     rng = np.random.default_rng(seed)
     coff = 1 + int(overlap)
     state_width = coff * head_dim
-    block_size = 4 if compress_ratio == 4 else 8
+    state_dim = 2 * state_width
+    state_block_size = 4 if compress_ratio == 4 else 8
 
     if seq_len is None:
         seq_len = 2 * compress_ratio
     num_tokens = num_reqs * seq_len
 
-    max_blocks = (seq_len + block_size - 1) // block_size
-    num_state_blocks = num_reqs * max_blocks + 1
+    max_blocks = (seq_len + state_block_size - 1) // state_block_size
+    num_state_pages = num_reqs * max_blocks + 1  # +1 spare (page 0)
 
+    # Compressed-KV output pages follow the state pages in the same buffer.
+    num_kv_pages = (num_tokens // PAGE_SIZE) + 4
+    num_pages = num_state_pages + num_kv_pages
+
+    # Per-request contiguous physical state pages (page 0 left as spare).
     block_table = np.zeros((num_reqs, max_blocks), np.int32)
     nxt = 1
     for r in range(num_reqs):
@@ -70,17 +80,21 @@ def _make_inputs(
     token_to_req_indices = np.repeat(
         np.arange(num_reqs, dtype=np.int32), seq_len)
 
+    # Compressor (state) slot = physical slot of this token's logical position,
+    # so the stage-2 window gather reads back exactly what stage 1 wrote.
     slot_mapping = np.empty(num_tokens, np.int32)
     for t in range(num_tokens):
         r = int(token_to_req_indices[t])
         p = int(positions[t])
-        slot_mapping[t] = block_table[r, p // block_size] * block_size \
-            + p % block_size
+        slot_mapping[t] = block_table[r, p // state_block_size] \
+            * state_block_size + p % state_block_size
 
-    kv_blk = 8
-    kv_num_blocks = (num_tokens // kv_blk) + 4
-    kv_slot_mapping = rng.permutation(
-        kv_num_blocks * kv_blk)[:num_tokens].astype(np.int32)
+    # KV slots live in the KV page range so boundary writes never clobber the
+    # state bytes the gather still needs.
+    kv_base = num_state_pages * PAGE_SIZE
+    kv_capacity = num_kv_pages * PAGE_SIZE
+    kv_slot_mapping = (
+        kv_base + rng.permutation(kv_capacity)[:num_tokens]).astype(np.int32)
 
     if num_pad > 0:
         pad_idx = rng.permutation(num_tokens)[:num_pad]
@@ -98,22 +112,19 @@ def _make_inputs(
     cos_sin_cache = rng.standard_normal(
         (max_pos, rope_head_dim), dtype=np.float32)
 
-    packed_width = indexer_packed_width(head_dim, quant_block)
-    state_cache = np.zeros(
-        (num_state_blocks, block_size, 2 * state_width), dtype=np.float32)
-    kv_cache = np.zeros(
-        (kv_num_blocks, kv_blk, packed_width), dtype=np.uint8)
+    cache_shape = shared_indexer_cache_shape(
+        num_pages, PAGE_SIZE, head_dim, quant_block)
+    cache = np.zeros(cache_shape, dtype=np.uint8)
 
     return dict(
         hidden_states=hidden_states, wkv_wgate=wkv_wgate, ape=ape,
         norm_weight=norm_weight, cos_sin_cache=cos_sin_cache,
         positions=positions, slot_mapping=slot_mapping,
         block_table=block_table, token_to_req_indices=token_to_req_indices,
-        kv_slot_mapping=kv_slot_mapping, state_cache=state_cache,
-        kv_cache=kv_cache,
-        block_size=block_size, head_dim=head_dim, rope_head_dim=rope_head_dim,
-        compress_ratio=compress_ratio, overlap=overlap, rms_eps=1e-6,
-        quant_block=quant_block)
+        kv_slot_mapping=kv_slot_mapping, cache=cache,
+        state_block_size=state_block_size, head_dim=head_dim,
+        rope_head_dim=rope_head_dim, compress_ratio=compress_ratio,
+        overlap=overlap, rms_eps=1e-6, quant_block=quant_block)
 
 
 def _to_jax(kw):
@@ -125,35 +136,40 @@ def _to_jax(kw):
 
 def _reference(kw):
     coff = 1 + int(kw["overlap"])
-    state_width = coff * kw["head_dim"]
+    head_dim = kw["head_dim"]
+    state_width = coff * head_dim
+    state_dim = 2 * state_width
 
     hidden = jnp.asarray(kw["hidden_states"]).astype(jnp.float32)
     kv_score = hidden @ jnp.asarray(kw["wkv_wgate"]).T
     kv = kv_score[:, :state_width]
     score = kv_score[:, state_width:2 * state_width]
 
-    state_cache = save_partial_states(
+    cache = jnp.asarray(kw["cache"])
+    state_view = unpack_state_cache(
+        cache, kw["state_block_size"], state_dim)
+    state_view = save_partial_states(
         kv=kv, score=score, ape=jnp.asarray(kw["ape"]),
         positions=jnp.asarray(kw["positions"]),
-        state_cache=jnp.asarray(kw["state_cache"]),
+        state_cache=state_view,
         slot_mapping=jnp.asarray(kw["slot_mapping"]),
         compress_ratio=kw["compress_ratio"])
+    cache = pack_state_cache(cache, state_view)
 
-    kv_cache = compress_norm_rope_store_indexer(
-        state_cache=state_cache,
+    cache = compress_norm_rope_store_indexer(
+        cache=cache,
         positions=jnp.asarray(kw["positions"]),
         slot_mapping=jnp.asarray(kw["slot_mapping"]),
         block_table=jnp.asarray(kw["block_table"]),
         token_to_req_indices=jnp.asarray(kw["token_to_req_indices"]),
         kv_slot_mapping=jnp.asarray(kw["kv_slot_mapping"]),
-        kv_cache=jnp.asarray(kw["kv_cache"]),
         rms_weight=jnp.asarray(kw["norm_weight"]),
         cos_sin_cache=jnp.asarray(kw["cos_sin_cache"]),
-        block_size=kw["block_size"], head_dim=kw["head_dim"],
+        state_block_size=kw["state_block_size"], head_dim=head_dim,
         rope_head_dim=kw["rope_head_dim"],
         compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
         rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
-    return state_cache, kv_cache
+    return cache
 
 
 _CASES = [
@@ -170,18 +186,17 @@ def test_compressor_forward_indexer_matches_composition(
         compress_ratio, overlap, seq_len, num_pad, seed):
     kw = _make_inputs(compress_ratio, overlap, seq_len=seq_len,
                       num_pad=num_pad, seed=seed)
-    exp_state, exp_kv = _reference(kw)
+    exp_cache = _reference(kw)
 
-    act_state, act_kv = compressor_forward_indexer(**_to_jax(kw))
+    act_cache = compressor_forward_indexer(**_to_jax(kw))
 
-    np.testing.assert_allclose(
-        np.asarray(act_state), np.asarray(exp_state), rtol=1e-5, atol=1e-5)
-    # Both sides drive the same packed kernel, so the byte buffer is exact.
+    # Both sides drive the same kernels over the same shared buffer, so the
+    # whole byte buffer (state region + packed KV) must match exactly.
     np.testing.assert_array_equal(
-        np.asarray(act_kv), np.asarray(exp_kv))
+        np.asarray(act_cache), np.asarray(exp_cache))
 
-    assert np.any(np.asarray(act_state) != 0.0)
-    assert np.any(np.asarray(act_kv) != 0)
+    # Sanity: the pipeline actually wrote something into the shared buffer.
+    assert np.any(np.asarray(act_cache) != 0)
 
 
 def test_compressor_forward_indexer_eval_shape():
@@ -190,40 +205,36 @@ def test_compressor_forward_indexer_eval_shape():
 
     def fn(hidden_states, wkv_wgate, ape, norm_weight, cos_sin_cache,
            positions, slot_mapping, block_table, token_to_req_indices,
-           kv_slot_mapping, state_cache, kv_cache):
+           kv_slot_mapping, cache):
         return compressor_forward_indexer(
             hidden_states=hidden_states, wkv_wgate=wkv_wgate, ape=ape,
             norm_weight=norm_weight, cos_sin_cache=cos_sin_cache,
             positions=positions, slot_mapping=slot_mapping,
             block_table=block_table,
             token_to_req_indices=token_to_req_indices,
-            kv_slot_mapping=kv_slot_mapping, state_cache=state_cache,
-            kv_cache=kv_cache,
-            block_size=kw["block_size"], head_dim=kw["head_dim"],
+            kv_slot_mapping=kv_slot_mapping, cache=cache,
+            state_block_size=kw["state_block_size"], head_dim=kw["head_dim"],
             rope_head_dim=kw["rope_head_dim"],
             compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
             rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
 
-    out_state, out_kv = jax.eval_shape(
+    out_cache = jax.eval_shape(
         fn, jkw["hidden_states"], jkw["wkv_wgate"], jkw["ape"],
         jkw["norm_weight"], jkw["cos_sin_cache"], jkw["positions"],
         jkw["slot_mapping"], jkw["block_table"], jkw["token_to_req_indices"],
-        jkw["kv_slot_mapping"], jkw["state_cache"], jkw["kv_cache"])
-    assert out_state.shape == kw["state_cache"].shape
-    assert out_kv.shape == kw["kv_cache"].shape
-    assert out_kv.dtype == jnp.uint8
+        jkw["kv_slot_mapping"], jkw["cache"])
+    assert out_cache.shape == kw["cache"].shape
+    assert out_cache.dtype == jnp.uint8
 
 
 @requires_tpu
 def test_compressor_forward_indexer_runs_on_tpu():
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
-    exp_state, exp_kv = _reference(kw)
+    exp_cache = _reference(kw)
 
-    act_state, act_kv = compressor_forward_indexer(**_to_jax(kw))
-    act_kv.block_until_ready()
-    assert act_kv.devices().pop().platform == "tpu"
+    act_cache = compressor_forward_indexer(**_to_jax(kw))
+    act_cache.block_until_ready()
+    assert act_cache.devices().pop().platform == "tpu"
 
-    np.testing.assert_allclose(
-        np.asarray(act_state), np.asarray(exp_state), rtol=1e-4, atol=1e-4)
     np.testing.assert_array_equal(
-        np.asarray(act_kv), np.asarray(exp_kv))
+        np.asarray(act_cache), np.asarray(exp_cache))
