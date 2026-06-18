@@ -27,8 +27,9 @@ Both paths consume identical inputs; their byte-packed (GPU) and paged (TPU)
 outputs are decoded back to fp32 ``[num_boundary_tokens, head_dim]`` and
 compared.
 
-The JAX sparse kernel now packs UE8M0 power-of-two block scales matching the
-GPU oracle (the indexer path still uses ``quantize_tensor`` absmax scales).
+Both JAX kernels now pack UE8M0 power-of-two block scales: the sparse path's
+e8m0 scale bytes alias the GPU oracle exactly, and the indexer uses the same
+power-of-two scheme (the GPU indexer oracle just stores that scale as float32).
 Decoded outputs are still compared semantically (per-token cosine + rel-L2),
 not bit-for-bit, because Triton-interpret and JAX round fp8/bf16 differently.
 Exact per-block scale-exponent equality is still not asserted (rounding can
@@ -580,11 +581,12 @@ def test_gpu_and_tpu_sparse_scales_are_identical_exponents():
 
 
 @pytest.mark.skip(
-    reason="JAX quantize_tensor scales differ from GPU UE8M0 exponents")
+    reason="indexer scales are now power-of-two on both sides, but exact"
+    " exponent equality can still shift +-1 under interpret-mode rounding")
 @requires_gpu_kernel_indexer
 @pytest.mark.gpu_oracle
 def test_gpu_and_tpu_indexer_scales_are_identical_exponents():
-    """GPU UE8M0 scale vs JAX quantize_tensor scale (not comparable)."""
+    """GPU power-of-two scale vs JAX power-of-two scale (same scheme now)."""
     kw = _make_inputs(
         128, False, head_dim=128, quant_block=128, seq_len=256, seed=12)
     slots = _boundary_slots(kw)

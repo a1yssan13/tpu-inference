@@ -44,16 +44,15 @@ HBM relayouts.
 Shared cache layout (indexer / head_dim=128 path)
 -------------------------------------------------
 The lightning indexer overlays the same way via ``shared_indexer_cache_shape``,
-only the byte sizes differ: ``width = align_to(132, 128) = 256``. A KV record is
-``[ fp8 128 | scale 4 f32 ] + pad`` and one state token (``state_dim`` f32) tiles
-``page_size // state_block_size`` row-slots. The same ``pack_state_cache`` /
-``unpack_state_cache`` helpers and ``unpack_indexer_kv_cache`` apply.
+only the byte sizes differ: ``width = align_to(129, 128) = 256``. A KV record is
+``[ fp8 128 | scale 1 e8m0 ] + pad`` and one state token (``state_dim`` f32)
+tiles ``page_size // state_block_size`` row-slots. The same
+``pack_state_cache`` / ``unpack_state_cache`` helpers and
+``unpack_indexer_kv_cache`` apply.
 """
 
 import jax
 import jax.numpy as jnp
-
-from tpu_inference.layers.common.quantization import quantize_tensor
 
 
 def _to_byte_lane(x: jax.Array) -> jax.Array:
@@ -108,7 +107,8 @@ def sparse_packed_width(nope_dim: int, rope_head_dim: int,
 
 def indexer_packed_width(head_dim: int, quant_block: int) -> int:
     """Bytes per token in the packed indexer (head_dim=128) KV cache."""
-    return head_dim + (head_dim // quant_block) * 4
+    # fp8 (1B) + UE8M0 block scale (1B)
+    return head_dim + (head_dim // quant_block)
 
 
 def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
@@ -130,11 +130,16 @@ def unpack_sparse_kv_cache(kv_cache: jax.Array, nope_dim: int,
 
 def unpack_indexer_kv_cache(kv_cache: jax.Array, head_dim: int,
                             quant_block: int):
-    """Split the packed indexer KV cache into ``(fp8, scale)`` views."""
+    """Split the packed indexer KV cache into ``(fp8, scale)`` views.
+
+    The block scale is UE8M0 (``float8_e8m0fnu``, one byte per block) and is
+    returned as the equivalent power-of-two ``float32``.
+    """
     n_qb = head_dim // quant_block
     fp8 = _from_byte_lane(kv_cache[..., :head_dim], jnp.float8_e4m3fn)
-    scale = _from_byte_lane(kv_cache[..., head_dim:head_dim + n_qb * 4],
-                            jnp.float32)
+    scale = _from_byte_lane(
+        kv_cache[..., head_dim:head_dim + n_qb],
+        jnp.float8_e8m0fnu).astype(jnp.float32)
     return fp8, scale
 
 
@@ -470,7 +475,7 @@ def compress_norm_rope_store_indexer(
       ``state_block_size`` tokens per page.
     * The compressed indexer KV cache is written (boundary tokens only) one
       row-slot per token, addressed by ``kv_slot_mapping``. Each record fills
-      the minor dim ``width`` (=256) as ``[ fp8 (128) | scale f32 (4) ]`` + pad.
+      the minor dim ``width`` (=256) as ``[ fp8 (128) | scale e8m0 (1) ]`` + pad.
     """
     # state_dim packs [kv_state | score_state], each coff*head_dim wide.
     coff = 1 + int(overlap)
@@ -500,10 +505,11 @@ def compress_norm_rope_store_indexer(
         rope_head_dim=rope_head_dim,
     )
 
-    q, scale = quantize_tensor(
-        jnp.float8_e4m3fn, compressed, axis=-1, block_size=quant_block)
+    q, scale = quantize_fp8_ue8m0(compressed, quant_block)
 
-    # Per-token record [fp8 | scale f32]; pad up to the cache's minor dim.
+    # Per-token record [fp8 | UE8M0 scale]; pad up to the cache's minor dim.
+    # One e8m0 scale byte matches the sparse path and the power-of-two scheme
+    # the indexer attention kernel will read back (tpu-inference#2905).
     record = jnp.concatenate(
         [_to_byte_lane(q), _to_byte_lane(scale)], axis=-1)
 
