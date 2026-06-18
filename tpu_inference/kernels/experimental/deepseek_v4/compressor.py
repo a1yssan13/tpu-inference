@@ -37,7 +37,14 @@ def _project_and_save(
     coff = 1 + int(overlap)
     state_width = coff * head_dim
 
-    kv_score = hidden_states.astype(jnp.float32) @ wkv_wgate.T
+    # Project at full fp32 precision: TPU's default matmul precision would
+    # down-cast the fp32 inputs to bf16, so HIGHEST keeps the result identical
+    # on CPU and TPU (and matches a plain NumPy fp32 GEMM in the tests).
+    kv_score = jnp.matmul(
+        hidden_states.astype(jnp.float32),
+        wkv_wgate.T,
+        precision=jax.lax.Precision.HIGHEST,
+    )
     # [num_tokens, 2 * coff * head_dim]
     kv = kv_score[:, :state_width] # [num_tokens, coff * head_dim]
     score = kv_score[:, state_width:2 * state_width] # [num_tokens, coff * head_dim]
@@ -82,7 +89,7 @@ def compressor_forward(
       per page; ``block_table`` maps logical positions to state pages for the
       boundary window gather. ``slot_mapping < 0`` skips padded tokens.
     * **Compressed KV cache** (write boundary tokens only): packed
-      ``[nope fp8 | rope bf16 | scale f32]`` uint8 records, one row-slot per
+      ``[nope fp8 | rope bf16 | scale e8m0]`` uint8 records, one row-slot per
       token. Addressed by ``kv_slot_mapping`` at ``page_size`` (=64) slots
       per page; only tokens where ``(position + 1) % compress_ratio == 0`` are
       stored.

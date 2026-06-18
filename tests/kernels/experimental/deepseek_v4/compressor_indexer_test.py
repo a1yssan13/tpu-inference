@@ -13,11 +13,17 @@
 # limitations under the License.
 """Tests for the lightning-indexer compressor orchestrator (Milestone 3).
 
-``compressor_forward_indexer`` composes the projection GEMM,
+``compressor_forward_indexer`` chains the projection GEMM,
 ``save_partial_states`` (Milestone 1) and
-``compress_norm_rope_store_indexer`` (Milestone 2 head=128 path). The
-reference drives the two trusted JAX kernels directly after the same JAX
-projection matmul.
+``compress_norm_rope_store_indexer`` (Milestone 2 head=128 path) over one
+shared ``uint8`` buffer.
+
+Like ``compressor_test``, these tests compare against a *naive NumPy
+end-to-end reference* (``_naive_reference``): fp32 projection, a plain-Python
+state scatter, then the trusted indexer boundary ground truth
+(``compress_norm_rope_store_indexer_ref``, reused from
+``compress_norm_rope_indexer_test``). We compare the dequantized indexer KV at
+the slots the boundary store actually wrote.
 
     .venv/bin/python -m pytest \
         tests/kernels/experimental/deepseek_v4/compressor_indexer_test.py -v
@@ -29,12 +35,11 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store_indexer, pack_state_cache,
-    shared_indexer_cache_shape, unpack_state_cache)
-from tpu_inference.kernels.experimental.deepseek_v4.compress_store import (
-    save_partial_states)
+    shared_indexer_cache_shape, unpack_indexer_kv_cache)
 from tpu_inference.kernels.experimental.deepseek_v4.compressor import (
     compressor_forward_indexer)
+from tests.kernels.experimental.deepseek_v4.compress_norm_rope_indexer_test \
+    import compress_norm_rope_store_indexer_ref
 
 requires_tpu = pytest.mark.skipif(
     jax.devices()[0].platform != "tpu",
@@ -134,42 +139,83 @@ def _to_jax(kw):
     }
 
 
-def _reference(kw):
+def _save_state_ref(kv, score, kw):
+    """Plain-NumPy ``save_partial_states``: build the f32 state view."""
     coff = 1 + int(kw["overlap"])
-    head_dim = kw["head_dim"]
-    state_width = coff * head_dim
-    state_dim = 2 * state_width
+    state_dim = 2 * coff * kw["head_dim"]
+    sb = kw["state_block_size"]
+    num_pages = kw["cache"].shape[0]
+    ape = kw["ape"].astype(np.float32)
+    positions = kw["positions"]
+    slot_mapping = kw["slot_mapping"]
 
-    hidden = jnp.asarray(kw["hidden_states"]).astype(jnp.float32)
-    kv_score = hidden @ jnp.asarray(kw["wkv_wgate"]).T
+    flat = np.zeros((num_pages * sb, state_dim), np.float32)
+    for t in range(positions.shape[0]):
+        slot = int(slot_mapping[t])
+        if slot < 0:
+            continue
+        score_state = score[t] + ape[int(positions[t]) % kw["compress_ratio"]]
+        flat[slot] = np.concatenate([kv[t], score_state])
+    return flat.reshape(num_pages, sb, state_dim)
+
+
+def _dequant(fp8, scale, kw):
+    """Reconstruct fp32 indexer KV ``[num_slots, head_dim]`` from a record."""
+    head_dim = kw["head_dim"]
+    n_qb = head_dim // kw["quant_block"]
+    fp8 = np.asarray(fp8).reshape(-1, head_dim).astype(np.float32)
+    scale = np.asarray(scale).reshape(-1, n_qb).astype(np.float32)
+    return (fp8.reshape(-1, n_qb, kw["quant_block"]) *
+            scale[:, :, None]).reshape(-1, head_dim)
+
+
+def _naive_reference(kw):
+    """Naive end-to-end NumPy ground truth for the indexer compressor.
+
+    Indexer twin of ``compressor_test._naive_reference``: fp32 projection, the
+    partial-state scatter, then the trusted indexer boundary ground truth.
+    Returns the dequantized indexer KV per flat KV slot.
+    """
+    coff = 1 + int(kw["overlap"])
+    state_width = coff * kw["head_dim"]
+
+    hidden = kw["hidden_states"].astype(np.float32)
+    kv_score = hidden @ kw["wkv_wgate"].astype(np.float32).T
     kv = kv_score[:, :state_width]
     score = kv_score[:, state_width:2 * state_width]
 
-    cache = jnp.asarray(kw["cache"])
-    state_view = unpack_state_cache(
-        cache, kw["state_block_size"], state_dim)
-    state_view = save_partial_states(
-        kv=kv, score=score, ape=jnp.asarray(kw["ape"]),
-        positions=jnp.asarray(kw["positions"]),
-        state_cache=state_view,
-        slot_mapping=jnp.asarray(kw["slot_mapping"]),
-        compress_ratio=kw["compress_ratio"])
-    cache = pack_state_cache(cache, state_view)
+    state_cache = _save_state_ref(kv, score, kw)
 
-    cache = compress_norm_rope_store_indexer(
-        cache=cache,
-        positions=jnp.asarray(kw["positions"]),
-        slot_mapping=jnp.asarray(kw["slot_mapping"]),
-        block_table=jnp.asarray(kw["block_table"]),
-        token_to_req_indices=jnp.asarray(kw["token_to_req_indices"]),
-        kv_slot_mapping=jnp.asarray(kw["kv_slot_mapping"]),
-        rms_weight=jnp.asarray(kw["norm_weight"]),
-        cos_sin_cache=jnp.asarray(kw["cos_sin_cache"]),
-        state_block_size=kw["state_block_size"], head_dim=head_dim,
-        rope_head_dim=kw["rope_head_dim"],
-        compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
-        rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
-    return cache
+    fp8, scale = compress_norm_rope_store_indexer_ref(
+        state_cache=state_cache, positions=kw["positions"],
+        slot_mapping=kw["slot_mapping"], block_table=kw["block_table"],
+        token_to_req_indices=kw["token_to_req_indices"],
+        kv_slot_mapping=kw["kv_slot_mapping"], rms_weight=kw["norm_weight"],
+        cos_sin_cache=kw["cos_sin_cache"],
+        state_block_size=kw["state_block_size"], head_dim=kw["head_dim"],
+        rope_head_dim=kw["rope_head_dim"], compress_ratio=kw["compress_ratio"],
+        overlap=kw["overlap"], rms_eps=kw["rms_eps"],
+        quant_block=kw["quant_block"])
+    return _dequant(fp8, scale, kw)
+
+
+def _dequant_written(act_cache, kw):
+    """Unpack the kernel's shared buffer and dequantize every KV row-slot."""
+    fp8, scale = unpack_indexer_kv_cache(
+        act_cache, kw["head_dim"], kw["quant_block"])
+    return _dequant(fp8, scale, kw)
+
+
+def _written_slots(kw):
+    """Flat KV slots actually written (valid boundary tokens)."""
+    slots = []
+    for t in range(kw["positions"].shape[0]):
+        if kw["slot_mapping"][t] < 0 or kw["kv_slot_mapping"][t] < 0:
+            continue
+        if (int(kw["positions"][t]) + 1) % kw["compress_ratio"] != 0:
+            continue
+        slots.append(int(kw["kv_slot_mapping"][t]))
+    return np.array(sorted(set(slots)), dtype=np.int64)
 
 
 _CASES = [
@@ -182,21 +228,21 @@ _CASES = [
 
 @pytest.mark.parametrize(
     "compress_ratio,overlap,seq_len,num_pad,seed", _CASES)
-def test_compressor_forward_indexer_matches_composition(
+def test_compressor_forward_indexer_matches_reference(
         compress_ratio, overlap, seq_len, num_pad, seed):
     kw = _make_inputs(compress_ratio, overlap, seq_len=seq_len,
                       num_pad=num_pad, seed=seed)
-    exp_cache = _reference(kw)
+    ref_deq = _naive_reference(kw)
 
-    act_cache = compressor_forward_indexer(**_to_jax(kw))
+    act_cache = np.asarray(compressor_forward_indexer(**_to_jax(kw)))
+    act_deq = _dequant_written(act_cache, kw)
 
-    # Both sides drive the same kernels over the same shared buffer, so the
-    # whole byte buffer (state region + packed KV) must match exactly.
-    np.testing.assert_array_equal(
-        np.asarray(act_cache), np.asarray(exp_cache))
-
-    # Sanity: the pipeline actually wrote something into the shared buffer.
-    assert np.any(np.asarray(act_cache) != 0)
+    # Compare dequantized indexer KV at the boundary slots actually written;
+    # the tolerance absorbs the projection GEMM's fp32 rounding.
+    slots = _written_slots(kw)
+    assert slots.size > 0
+    np.testing.assert_allclose(
+        act_deq[slots], ref_deq[slots], rtol=2e-2, atol=2e-2)
 
 
 def test_compressor_forward_indexer_eval_shape():
@@ -230,11 +276,14 @@ def test_compressor_forward_indexer_eval_shape():
 @requires_tpu
 def test_compressor_forward_indexer_runs_on_tpu():
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
-    exp_cache = _reference(kw)
+    ref_deq = _naive_reference(kw)
 
-    act_cache = compressor_forward_indexer(**_to_jax(kw))
-    act_cache.block_until_ready()
-    assert act_cache.devices().pop().platform == "tpu"
+    act = compressor_forward_indexer(**_to_jax(kw))
+    act.block_until_ready()
+    assert act.devices().pop().platform == "tpu"
 
-    np.testing.assert_array_equal(
-        np.asarray(act_cache), np.asarray(exp_cache))
+    act_deq = _dequant_written(np.asarray(act), kw)
+    slots = _written_slots(kw)
+    assert slots.size > 0
+    np.testing.assert_allclose(
+        act_deq[slots], ref_deq[slots], rtol=2e-2, atol=2e-2)

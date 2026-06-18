@@ -13,18 +13,17 @@
 # limitations under the License.
 """Tests for the DeepSeek-V4 KV compressor orchestrator (Milestone 3).
 
-``compressor_forward`` is a thin composition of already-validated pieces: a
-projection GEMM, ``save_partial_states`` (Milestone 1) and
-``compress_norm_rope_store`` (Milestone 2), all driven over a single shared
-``uint8`` cache buffer (state + compressed KV overlaid). The unique behavior it
-adds is the projection, the kv/score split order, the state <-> shared-buffer
-round-trip, and threading arguments through to the kernels.
+``compressor_forward`` chains a projection GEMM, ``save_partial_states``
+(Milestone 1) and ``compress_norm_rope_store`` (Milestone 2) over a single
+shared ``uint8`` cache buffer (state + compressed KV overlaid).
 
-    The reference therefore computes the projection with the same JAX matmul
-    and drives the same trusted kernels directly, asserting that
-    ``compressor_forward`` produces the same shared ``cache`` buffer. The
-    kernels' own numerical ground truth lives in ``compress_store_test.py`` and
-    ``compress_norm_rope_test.py``.
+Rather than re-running the JAX kernels, these tests compare against a *naive
+NumPy end-to-end reference* (``_naive_reference``): plain-fp32 projection, a
+plain-Python state scatter, then the already-trusted boundary ground truth
+(``compress_norm_rope_store_ref``, reused from ``compress_norm_rope_test``).
+``compressor_forward`` runs its projection at HIGHEST precision, so the fp32
+NumPy GEMM matches it on TPU as well as on CPU. We compare the *dequantized*
+compressed-KV at the slots the boundary store actually wrote.
 
 Crucially, the compressor (state) slot mapping is built *consistently with the
 block table* (the physical slot of a token's logical position), so the stage-2
@@ -40,12 +39,11 @@ import numpy as np
 import pytest
 
 from tpu_inference.kernels.experimental.deepseek_v4.compress_norm_rope import (
-    compress_norm_rope_store, pack_state_cache, shared_sparse_cache_shape,
-    unpack_state_cache)
-from tpu_inference.kernels.experimental.deepseek_v4.compress_store import (
-    save_partial_states)
+    shared_sparse_cache_shape, unpack_sparse_kv_cache)
 from tpu_inference.kernels.experimental.deepseek_v4.compressor import (
     compressor_forward)
+from tests.kernels.experimental.deepseek_v4.compress_norm_rope_test import (
+    compress_norm_rope_store_ref)
 
 requires_tpu = pytest.mark.skipif(
     jax.devices()[0].platform != "tpu",
@@ -146,52 +144,87 @@ def _to_jax(kw):
     }
 
 
-def _reference(kw):
-    """Inline composition: same JAX projection, then the trusted kernels.
+def _save_state_ref(kv, score, kw):
+    """Plain-NumPy ``save_partial_states``: build the f32 state view."""
+    coff = 1 + int(kw["overlap"])
+    state_dim = 2 * coff * kw["head_dim"]
+    sb = kw["state_block_size"]
+    num_pages = kw["cache"].shape[0]
+    ape = kw["ape"].astype(np.float32)
+    positions = kw["positions"]
+    slot_mapping = kw["slot_mapping"]
 
-    The projection uses the *same* JAX matmul as ``compressor_forward`` (not a
-    NumPy fp32 matmul) so the comparison is deterministic on TPU, where the
-    default matmul precision casts fp32 inputs to bf16. This isolates what the
-    orchestrator adds -- the kv/score split order, argument threading, the
-    block-table-consistent slot mapping and the state <-> shared-buffer
-    round-trip -- while the kernels' own numerical ground truth stays in
-    compress_store_test / compress_norm_rope_test.
+    flat = np.zeros((num_pages * sb, state_dim), np.float32)
+    for t in range(positions.shape[0]):
+        slot = int(slot_mapping[t])
+        if slot < 0:
+            continue
+        score_state = score[t] + ape[int(positions[t]) % kw["compress_ratio"]]
+        flat[slot] = np.concatenate([kv[t], score_state])
+    return flat.reshape(num_pages, sb, state_dim)
+
+
+def _dequant(nope, rope, scale, kw):
+    """Reconstruct fp32 compressed-KV ``[num_slots, head_dim]`` from a record."""
+    nope_dim = kw["head_dim"] - kw["rope_head_dim"]
+    n_qb = nope_dim // kw["quant_block"]
+    nope = np.asarray(nope).reshape(-1, nope_dim).astype(np.float32)
+    rope = np.asarray(rope).reshape(-1, kw["rope_head_dim"]).astype(np.float32)
+    scale = np.asarray(scale).reshape(-1, n_qb).astype(np.float32)
+    nope_deq = (nope.reshape(-1, n_qb, kw["quant_block"]) *
+                scale[:, :, None]).reshape(-1, nope_dim)
+    return np.concatenate([nope_deq, rope], axis=-1)
+
+
+def _naive_reference(kw):
+    """Naive end-to-end NumPy ground truth for the whole compressor.
+
+    Mirrors ``compressor_forward`` in plain NumPy: an fp32 projection GEMM, the
+    partial-state scatter, then the already-trusted boundary ground truth
+    (``compress_norm_rope_store_ref``). Returns the dequantized compressed-KV
+    per flat KV slot (``num_pages * PAGE_SIZE`` rows).
     """
     coff = 1 + int(kw["overlap"])
-    head_dim = kw["head_dim"]
-    state_width = coff * head_dim
-    state_dim = 2 * state_width
+    state_width = coff * kw["head_dim"]
 
-    hidden = jnp.asarray(kw["hidden_states"]).astype(jnp.float32)
-    kv_score = hidden @ jnp.asarray(kw["wkv_wgate"]).T
+    hidden = kw["hidden_states"].astype(np.float32)
+    kv_score = hidden @ kw["wkv_wgate"].astype(np.float32).T
     kv = kv_score[:, :state_width]
     score = kv_score[:, state_width:2 * state_width]
 
-    cache = jnp.asarray(kw["cache"])
-    state_view = unpack_state_cache(
-        cache, kw["state_block_size"], state_dim)
-    state_view = save_partial_states(
-        kv=kv, score=score, ape=jnp.asarray(kw["ape"]),
-        positions=jnp.asarray(kw["positions"]),
-        state_cache=state_view,
-        slot_mapping=jnp.asarray(kw["slot_mapping"]),
-        compress_ratio=kw["compress_ratio"])
-    cache = pack_state_cache(cache, state_view)
+    state_cache = _save_state_ref(kv, score, kw)
 
-    cache = compress_norm_rope_store(
-        cache=cache,
-        positions=jnp.asarray(kw["positions"]),
-        slot_mapping=jnp.asarray(kw["slot_mapping"]),
-        block_table=jnp.asarray(kw["block_table"]),
-        token_to_req_indices=jnp.asarray(kw["token_to_req_indices"]),
-        kv_slot_mapping=jnp.asarray(kw["kv_slot_mapping"]),
-        rms_weight=jnp.asarray(kw["norm_weight"]),
-        cos_sin_cache=jnp.asarray(kw["cos_sin_cache"]),
-        state_block_size=kw["state_block_size"], head_dim=head_dim,
-        rope_head_dim=kw["rope_head_dim"],
-        compress_ratio=kw["compress_ratio"], overlap=kw["overlap"],
-        rms_eps=kw["rms_eps"], quant_block=kw["quant_block"])
-    return cache
+    nope, rope, scale = compress_norm_rope_store_ref(
+        state_cache=state_cache, positions=kw["positions"],
+        slot_mapping=kw["slot_mapping"], block_table=kw["block_table"],
+        token_to_req_indices=kw["token_to_req_indices"],
+        kv_slot_mapping=kw["kv_slot_mapping"], rms_weight=kw["norm_weight"],
+        cos_sin_cache=kw["cos_sin_cache"],
+        state_block_size=kw["state_block_size"], head_dim=kw["head_dim"],
+        rope_head_dim=kw["rope_head_dim"], compress_ratio=kw["compress_ratio"],
+        overlap=kw["overlap"], rms_eps=kw["rms_eps"],
+        quant_block=kw["quant_block"])
+    return _dequant(nope, rope, scale, kw)
+
+
+def _dequant_written(act_cache, kw):
+    """Unpack the kernel's shared buffer and dequantize every KV row-slot."""
+    nope_dim = kw["head_dim"] - kw["rope_head_dim"]
+    nope, rope, scale = unpack_sparse_kv_cache(
+        act_cache, nope_dim, kw["rope_head_dim"], kw["quant_block"])
+    return _dequant(nope, rope, scale, kw)
+
+
+def _written_slots(kw):
+    """Flat KV slots actually written (valid boundary tokens)."""
+    slots = []
+    for t in range(kw["positions"].shape[0]):
+        if kw["slot_mapping"][t] < 0 or kw["kv_slot_mapping"][t] < 0:
+            continue
+        if (int(kw["positions"][t]) + 1) % kw["compress_ratio"] != 0:
+            continue
+        slots.append(int(kw["kv_slot_mapping"][t]))
+    return np.array(sorted(set(slots)), dtype=np.int64)
 
 
 # compress_ratio, overlap, seq_len, num_pad, seed
@@ -205,21 +238,22 @@ _CASES = [
 
 @pytest.mark.parametrize(
     "compress_ratio,overlap,seq_len,num_pad,seed", _CASES)
-def test_compressor_forward_matches_composition(
+def test_compressor_forward_matches_reference(
         compress_ratio, overlap, seq_len, num_pad, seed):
     kw = _make_inputs(compress_ratio, overlap, seq_len=seq_len,
                       num_pad=num_pad, seed=seed)
-    exp_cache = _reference(kw)
+    ref_deq = _naive_reference(kw)
 
-    act_cache = compressor_forward(**_to_jax(kw))
+    act_cache = np.asarray(compressor_forward(**_to_jax(kw)))
+    act_deq = _dequant_written(act_cache, kw)
 
-    # Both sides drive the same kernels over the same shared buffer, so the
-    # whole byte buffer (state region + packed KV) must match exactly.
-    np.testing.assert_array_equal(
-        np.asarray(act_cache), np.asarray(exp_cache))
-
-    # Sanity: the pipeline actually wrote something into the shared buffer.
-    assert np.any(np.asarray(act_cache) != 0)
+    # Compare the dequantized compressed-KV at the boundary slots actually
+    # written. The tolerance absorbs the projection GEMM's fp32 rounding; a
+    # wiring bug (wrong split / slot mapping / state round-trip) is gross.
+    slots = _written_slots(kw)
+    assert slots.size > 0
+    np.testing.assert_allclose(
+        act_deq[slots], ref_deq[slots], rtol=2e-2, atol=2e-2)
 
 
 def test_compressor_forward_eval_shape():
@@ -255,11 +289,14 @@ def test_compressor_forward_eval_shape():
 def test_compressor_forward_runs_on_tpu():
     """Executes on TPU and confirms the backend really is TPU."""
     kw = _make_inputs(128, False, seq_len=256, num_pad=4, seed=7)
-    exp_cache = _reference(kw)
+    ref_deq = _naive_reference(kw)
 
-    act_cache = compressor_forward(**_to_jax(kw))
-    act_cache.block_until_ready()
-    assert act_cache.devices().pop().platform == "tpu"
+    act = compressor_forward(**_to_jax(kw))
+    act.block_until_ready()
+    assert act.devices().pop().platform == "tpu"
 
-    np.testing.assert_array_equal(
-        np.asarray(act_cache), np.asarray(exp_cache))
+    act_deq = _dequant_written(np.asarray(act), kw)
+    slots = _written_slots(kw)
+    assert slots.size > 0
+    np.testing.assert_allclose(
+        act_deq[slots], ref_deq[slots], rtol=2e-2, atol=2e-2)
